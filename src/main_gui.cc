@@ -172,7 +172,8 @@ int main(){
      cap3.read(t);if(!t.empty())t.copyTo(fb3);}
     printf("[GUI] started, %dx%d\n",drm.w,drm.h);fflush(stdout);
 
-    int empty_cnt=0, det_skip=0, fps_cnt=0;
+    int empty_cnt=0, det_skip=0, fps_cnt=0, time_skip=0;
+    std::vector<DetectBox> last_boxes;
     auto fps_t0=std::chrono::steady_clock::now();
 
     while(1){
@@ -229,14 +230,14 @@ int main(){
             }
             empty_cnt=0;
             f.copyTo(frame);
-            // 检测跳帧: 每3帧跑一次NPU, 其余帧复用上次结果
+            // NPU检测跳帧: 每3帧更新一次框位置, 但每帧都画(消除闪烁)
             det_skip=(det_skip+1)%3;
-            if(det_skip==0){
-                std::vector<DetectBox>bx;det.detect(frame,bx);draw_boxes(frame,bx);
-            }
+            if(det_skip==0){last_boxes.clear();det.detect(frame,last_boxes);}
+            draw_boxes(frame,last_boxes);
             int bk=drm.fr^1;drm.clear(bk);
-            // 右上角时间 — 每30帧更新一次
-            if(det_skip==0){
+            // 时间每秒更新一次(~30帧)
+            time_skip=(time_skip+1)%30;
+            if(time_skip==0){
                 time_t now=time(0);struct tm*lt=localtime(&now);char tb[32];
                 strftime(tb,32,"%H:%M:%S",lt);ft_text_right(drm,bk,1890,15,tb,26,mk(220,220,220));
                 strftime(tb,32,"%Y.%m.%d",lt);ft_text_right(drm,bk,1890,50,tb,20,mk(150,150,150));
