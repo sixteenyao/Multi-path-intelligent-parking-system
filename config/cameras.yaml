@@ -1,0 +1,50 @@
+# 摄像头配置文件
+# 每一路摄像头可以单独配置 RTSP 地址、检测参数
+
+cameras:
+  - id: 1
+    name: "门口"
+    rtsp_url: "rtsp://192.168.1.101:554/stream"
+    enabled: true
+    width: 1920
+    height: 1080
+    fps: 15
+    detect:
+      classes: [0]           # 0=person, 只检测人
+      threshold: 0.3         # 置信度阈值
+
+  - id: 2
+    name: "后院"
+    rtsp_url: "rtsp://192.168.1.102:554/stream"
+    enabled: true
+    width: 1920
+    height: 1080
+    fps: 15
+    detect:
+      classes: [0, 2, 5, 7]  # person, car, bus, truck
+      threshold: 0.3
+
+  - id: 3
+    name: "车库"
+    rtsp_url: "rtsp://192.168.1.103:554/stream"
+    enabled: false            # 未启用
+    width: 1280
+    height: 720
+    fps: 10
+    detect:
+      classes: [0, 2]
+      threshold: 0.35
+
+# 全局设置
+global:
+  model_path: "model/yolov8n.rknn"
+  output:
+    rtsp_enabled: false
+    rtmp_url: "rtmp://192.168.1.100:1935/live/"
+    record_path: "/data/videos/"
+    record_retention_days: 7
+  npu:
+    cores: [0, 1, 2]         # 使用的NPU核心
+  alert:
+    enabled: true
+    mqtt_broker: "tcp://192.168.1.1:1883"

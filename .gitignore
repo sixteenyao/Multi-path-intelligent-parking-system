@@ -1,0 +1,7 @@
+build/
+*.o
+*.swp
+sysroot/
+tools/mediamtx
+*.rknn
+.vscode/
