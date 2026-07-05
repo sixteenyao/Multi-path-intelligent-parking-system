@@ -1,11 +1,11 @@
-// smart_camera GUI v5 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
+// smart_camera GUI v6 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
 // v1: 像素字体, 单通道
 // v2: 像素字体, 4通道选择, show_ret切换返回
 // v3: FreeType系统字体, 4通道选择, 直接返回按钮, 时间显示, 缓冲帧即时切换
 // v4: step=2跳像素渲染, NPU检测跳帧, usleep 3ms, 竖屏视频兼容
 // v5: 消除闪烁 + 帧定时调度(原视频FPS不变)
+// v6: 按钮中心点定位文字, 右下角FPS+NPU耗时叠加
 
-#include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
@@ -126,7 +126,7 @@ static int ft_width(const char*u8,int px){
 // 居中绘制文字 (水平+垂直居中)
 static void ft_text_center(Drm& d,int bk,int lx,int ly,int bw,int bh,const char*u8,int px,C4 clr){
     int tw=ft_width(u8,px);
-    ft_text(d,bk,lx+(bw-tw)/2,ly+(bh+px)/2,u8,px,clr);
+    ft_text(d,bk,lx+(bw-tw)/2,ly+bh/2,u8,px,clr);
 }
 
 // 右对齐绘制文字
@@ -179,6 +179,8 @@ int main(){
     {time_t now=time(0);struct tm*lt=localtime(&now);
      strftime(tb_time,32,"%H:%M:%S",lt);strftime(tb_date,32,"%Y.%m.%d",lt);}
     std::vector<DetectBox> last_boxes;
+    char fps_str[16]={"FPS: --"}, det_str[16]={"NPU: --ms"};
+    int det_ms=0;
     auto fps_t0=std::chrono::steady_clock::now();
     auto next_frame_time=std::chrono::steady_clock::now(); // 帧定时调度
 
@@ -202,13 +204,13 @@ int main(){
             {time_t now=time(0);struct tm*lt=localtime(&now);char tb[32];
              strftime(tb,32,"%H:%M:%S",lt);ft_text_right(drm,bk,1890,15,tb,26,mk(220,220,220));
              strftime(tb,32,"%Y.%m.%d",lt);ft_text_right(drm,bk,1890,50,tb,20,mk(150,150,150));}
-            // 4路区域按钮 — 文字在按钮内居中
+            // 4路区域按钮 — 字母居中于按钮中心
             for(int i=0;i<4;i++){
                 drm.fL(bk,btn[i].x,btn[i].y,bw,bh,cols[i]);
                 drm.bL(bk,btn[i].x,btn[i].y,bw,bh,mk(255,255,255),4);
                 char big[2]={(char)('A'+i),0};
-                ft_text_center(drm,bk,btn[i].x,btn[i].y,bw,bh-50,big,100,mk(255,255,255));
-                ft_text_center(drm,bk,btn[i].x,btn[i].y+bh-60,bw,40,"监控区域",22,mk(220,220,220));
+                int cx=btn[i].x+bw/2, cy=btn[i].y+bh/2;
+                ft_text(drm,bk,cx-ft_width(big,120)/2,cy+40,big,120,mk(255,255,255));
             }
             drm.flip();
             if(touch.clicked){for(int i=0;i<4;i++)if(tx>=btn[i].x&&tx<btn[i].x+bw&&ty>=btn[i].y&&ty<btn[i].y+bh){
@@ -220,7 +222,7 @@ int main(){
                 {int bk2=drm.fr^1;drm.clear(bk2);
                  drm.rot_write(bk2,frame,1920,1080);
                  drm.fL(bk2,20,20,90,50,mk(50,0,0));drm.bL(bk2,20,20,90,50,mk(200,100,100));
-                 ft_text_center(drm,bk2,20,20,90,50,"返回",22,mk(255,200,200));
+                 ft_text(drm,bk2,65-ft_width("返回",22)/2,52,"返回",22,mk(255,200,200));
                  drm.flip();}
                 break;}}
             usleep(16000);
@@ -240,7 +242,7 @@ int main(){
             f.copyTo(frame);
             // NPU检测跳帧: 每3帧更新一次框位置, 但每帧都画(消除闪烁)
             det_skip=(det_skip+1)%3;
-            if(det_skip==0){last_boxes.clear();det.detect(frame,last_boxes);}
+            if(det_skip==0){last_boxes.clear();auto t1=std::chrono::steady_clock::now();det.detect(frame,last_boxes);auto t2=std::chrono::steady_clock::now();det_ms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();snprintf(det_str,16,"NPU: %dms",det_ms);}
             draw_boxes(frame,last_boxes);
             int bk=drm.fr^1;drm.clear(bk);
             // 时间: 每30帧更新字符串, 但每帧都渲染(不闪)
@@ -253,15 +255,18 @@ int main(){
             ft_text_right(drm,bk,1890,15,tb_time,26,mk(220,220,220));
             ft_text_right(drm,bk,1890,50,tb_date,20,mk(150,150,150));
             drm.rot_write(bk,frame,1920,1080);
+            // 右下角: FPS + 推理耗时
+            ft_text_right(drm,bk,1890,1050,fps_str,22,mk(0,255,0));
+            ft_text_right(drm,bk,1890,1025,det_str,22,mk(255,200,0));
             // 返回按钮 — 文字居中
             drm.fL(bk,20,20,90,50,mk(50,0,0));drm.bL(bk,20,20,90,50,mk(200,100,100));
-            ft_text_center(drm,bk,20,20,90,50,"返回",22,mk(255,200,200));
+            ft_text(drm,bk,65-ft_width("返回",22)/2,52,"返回",22,mk(255,200,200));
             drm.flip();
             // FPS统计 (每2秒输出)
             fps_cnt++;
             auto fps_now=std::chrono::steady_clock::now();
             int fps_ms=std::chrono::duration_cast<std::chrono::milliseconds>(fps_now-fps_t0).count();
-            if(fps_ms>=2000){printf("[FPS] %.1f\n",fps_cnt*1000.0/fps_ms);fflush(stdout);fps_cnt=0;fps_t0=fps_now;}
+            if(fps_ms>=2000){double fps=fps_cnt*1000.0/fps_ms;snprintf(fps_str,16,"FPS: %.0f",fps);printf("[FPS] %.1f\n",fps);fflush(stdout);fps_cnt=0;fps_t0=fps_now;}
             if(touch.clicked){if(tx>=20&&tx<=110&&ty>=20&&ty<=70){state=MAIN;cam=-1;empty_cnt=0;}}
             // 帧定时: 按原视频FPS调度, 保持播放速度一致
             if(state==VIDEO){
