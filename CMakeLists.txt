@@ -45,7 +45,7 @@ target_include_directories(smart_camera_gui PRIVATE
 target_link_libraries(smart_camera_gui PRIVATE
     ${RKNN_API_LIB} ${RKNNRT_LIB} ${MPP_LIB} ${RGA_LIB}
     pthread dl atomic z drm freetype
-    ${OpenCV_CORE_LIB} ${OpenCV_IMGPROC_LIB} ${OpenCV_VIDEOIO_LIB}
+    ${OpenCV_CORE_LIB} ${OpenCV_IMGPROC_LIB} ${OpenCV_VIDEOIO_LIB} ${OpenCV_IMGCODECS_LIB}
 )
 target_link_options(smart_camera_gui PRIVATE "LINKER:--allow-shlib-undefined")
 
