@@ -84,15 +84,31 @@ int main(){
     C4 cols[]={mk(200,40,40),mk(40,180,40),mk(40,100,220),mk(220,180,40)};
     int bw=800,bh=400,g=40,bx=(1920-bw*2-g)/2,by=(1080-bh*2-g)/2;
     struct{int x,y;}btn[4]={{bx,by},{bx+bw+g,by},{bx,by+bh+g},{bx+bw+g,by+bh+g}};
+    // 启动时预读4路各一帧, 保证按钮一按就有画面
+    cv::Mat frame,fb0,fb1,fb2,fb3; int bg=0;
+    {cv::Mat t;cap0.read(t);if(!t.empty())t.copyTo(fb0);
+     cap1.read(t);if(!t.empty())t.copyTo(fb1);
+     cap2.read(t);if(!t.empty())t.copyTo(fb2);
+     cap3.read(t);if(!t.empty())t.copyTo(fb3);}
     printf("[GUI] started\n");fflush(stdout);
-    cv::Mat frame;
 
     while(1){touch.poll();int tx,ty;touch.landscape(tx,ty);
-        if(state==MAIN){int bk=drm.fr^1;drm.clear(bk);drm.tC(bk,0,0,1920,110,"ATK SMART SURVEILLANCE",mk(255,255,255),5);
+        // 后台轮读: 每轮读一路非活跃摄像头, 4路视频始终前进
+        {cv::Mat t;int c=bg;bg=(bg+1)%4;
+         if(c!=cam||state==MAIN){
+            if(c==0)cap0.read(t);else if(c==1)cap1.read(t);else if(c==2)cap2.read(t);else cap3.read(t);
+            if(!t.empty()){if(c==0)t.copyTo(fb0);else if(c==1)t.copyTo(fb1);else if(c==2)t.copyTo(fb2);else t.copyTo(fb3);}
+         }}
+
+        if(state==MAIN){
+            int bk=drm.fr^1;drm.clear(bk);drm.tC(bk,0,0,1920,110,"ATK SMART SURVEILLANCE",mk(255,255,255),5);
             for(int i=0;i<4;i++){drm.fL(bk,btn[i].x,btn[i].y,bw,bh,cols[i]);drm.bL(bk,btn[i].x,btn[i].y,bw,bh,mk(255,255,255),4);char big[2]={(char)('A'+i),0};drm.tC(bk,btn[i].x,btn[i].y+60,bw,200,big,mk(255,255,255),16);drm.tC(bk,btn[i].x,btn[i].y+280,bw,60,"ZONE",mk(220,220,220),5);}
             drm.flip();
-            if(touch.clicked){for(int i=0;i<4;i++)if(tx>=btn[i].x&&tx<btn[i].x+bw&&ty>=btn[i].y&&ty<btn[i].y+bh){cam=i;state=VIDEO;show_ret=0;}}
+            if(touch.clicked){for(int i=0;i<4;i++)if(tx>=btn[i].x&&tx<btn[i].x+bw&&ty>=btn[i].y&&ty<btn[i].y+bh){cam=i;state=VIDEO;show_ret=0;
+                // 进入视频时先取缓冲帧, 避免黑屏等待
+                if(cam==0)fb0.copyTo(frame);else if(cam==1)fb1.copyTo(frame);else if(cam==2)fb2.copyTo(frame);else fb3.copyTo(frame);}}
         }else{
+            // 活跃摄像头每帧都读, 保证流畅
             cv::Mat f;
             if(cam==0)cap0.read(f);else if(cam==1)cap1.read(f);else if(cam==2)cap2.read(f);else cap3.read(f);
             if(f.empty()){usleep(30000);continue;}
