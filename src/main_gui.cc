@@ -1,10 +1,10 @@
-// smart_camera GUI v3 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
+// smart_camera GUI v5 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
 // v1: 像素字体, 单通道
 // v2: 像素字体, 4通道选择, show_ret切换返回
 // v3: FreeType系统字体, 4通道选择, 直接返回按钮, 时间显示, 缓冲帧即时切换
-#include <iostream>
-#include <cstring>
-#include <cstdio>
+// v4: step=2跳像素渲染, NPU检测跳帧, usleep 3ms, 竖屏视频兼容
+// v5: 消除闪烁 + 帧定时调度(原视频FPS不变)
+
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
@@ -160,6 +160,8 @@ int main(){
     cap1.open("/root/videos/b.mp4");printf("[c1] %d\n",cap1.isOpened());
     cap2.open("/root/videos/c.mp4");printf("[c2] %d\n",cap2.isOpened());
     cap3.open("/root/videos/d.mp4");printf("[c3] %d\n",cap3.isOpened());
+    // 帧定时: 按25fps(40ms/帧)调度, 保证与原视频播放速度一致
+    int frame_interval_us[4]={40000,40000,40000,40000};
 
     enum{MAIN,VIDEO}state=MAIN;int cam=-1;
     C4 cols[]={mk(200,40,40),mk(40,180,40),mk(40,100,220),mk(220,180,40)};
@@ -173,8 +175,12 @@ int main(){
     printf("[GUI] started, %dx%d\n",drm.w,drm.h);fflush(stdout);
 
     int empty_cnt=0, det_skip=0, fps_cnt=0, time_skip=0;
+    char tb_time[32]={}, tb_date[32]={};
+    {time_t now=time(0);struct tm*lt=localtime(&now);
+     strftime(tb_time,32,"%H:%M:%S",lt);strftime(tb_date,32,"%Y.%m.%d",lt);}
     std::vector<DetectBox> last_boxes;
     auto fps_t0=std::chrono::steady_clock::now();
+    auto next_frame_time=std::chrono::steady_clock::now(); // 帧定时调度
 
     while(1){
         touch.poll();int tx,ty;touch.landscape(tx,ty);
@@ -207,6 +213,7 @@ int main(){
             drm.flip();
             if(touch.clicked){for(int i=0;i<4;i++)if(tx>=btn[i].x&&tx<btn[i].x+bw&&ty>=btn[i].y&&ty<btn[i].y+bh){
                 cam=i;state=VIDEO;empty_cnt=0;
+                next_frame_time=std::chrono::steady_clock::now();
                 // 用已缓冲帧立即显示，避免黑屏等待
                 if(cam==0)fb0.copyTo(frame);else if(cam==1)fb1.copyTo(frame);
                 else if(cam==2)fb2.copyTo(frame);else fb3.copyTo(frame);
@@ -216,6 +223,7 @@ int main(){
                  ft_text_center(drm,bk2,20,20,90,50,"返回",22,mk(255,200,200));
                  drm.flip();}
                 break;}}
+            usleep(16000);
         }else{
             cv::Mat f; bool ok=false;
             if(cam==0)ok=cap0.read(f);else if(cam==1)ok=cap1.read(f);
@@ -235,13 +243,15 @@ int main(){
             if(det_skip==0){last_boxes.clear();det.detect(frame,last_boxes);}
             draw_boxes(frame,last_boxes);
             int bk=drm.fr^1;drm.clear(bk);
-            // 时间每秒更新一次(~30帧)
+            // 时间: 每30帧更新字符串, 但每帧都渲染(不闪)
             time_skip=(time_skip+1)%30;
             if(time_skip==0){
-                time_t now=time(0);struct tm*lt=localtime(&now);char tb[32];
-                strftime(tb,32,"%H:%M:%S",lt);ft_text_right(drm,bk,1890,15,tb,26,mk(220,220,220));
-                strftime(tb,32,"%Y.%m.%d",lt);ft_text_right(drm,bk,1890,50,tb,20,mk(150,150,150));
+                time_t now=time(0);struct tm*lt=localtime(&now);
+                strftime(tb_time,32,"%H:%M:%S",lt);
+                strftime(tb_date,32,"%Y.%m.%d",lt);
             }
+            ft_text_right(drm,bk,1890,15,tb_time,26,mk(220,220,220));
+            ft_text_right(drm,bk,1890,50,tb_date,20,mk(150,150,150));
             drm.rot_write(bk,frame,1920,1080);
             // 返回按钮 — 文字居中
             drm.fL(bk,20,20,90,50,mk(50,0,0));drm.bL(bk,20,20,90,50,mk(200,100,100));
@@ -253,6 +263,13 @@ int main(){
             int fps_ms=std::chrono::duration_cast<std::chrono::milliseconds>(fps_now-fps_t0).count();
             if(fps_ms>=2000){printf("[FPS] %.1f\n",fps_cnt*1000.0/fps_ms);fflush(stdout);fps_cnt=0;fps_t0=fps_now;}
             if(touch.clicked){if(tx>=20&&tx<=110&&ty>=20&&ty<=70){state=MAIN;cam=-1;empty_cnt=0;}}
-        }usleep(3000);}
+            // 帧定时: 按原视频FPS调度, 保持播放速度一致
+            if(state==VIDEO){
+                next_frame_time+=std::chrono::microseconds(frame_interval_us[cam]);
+                auto now=std::chrono::steady_clock::now();
+                if(next_frame_time>now)std::this_thread::sleep_until(next_frame_time);
+                else next_frame_time=now;
+            }
+        }}
     det.release();return 0;
 }
