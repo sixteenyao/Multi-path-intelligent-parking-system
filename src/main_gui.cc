@@ -1,14 +1,14 @@
-// smart_camera GUI v8 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
+// smart_camera GUI v9 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
 // v1: 像素字体, 单通道
 // v2: 像素字体, 4通道选择, show_ret切换返回
 // v3: FreeType系统字体, 4通道选择, 直接返回按钮, 时间显示, 缓冲帧即时切换
 // v4: step=2跳像素渲染, NPU检测跳帧, usleep 3ms, 竖屏视频兼容
 // v5: 消除闪烁 + 帧定时调度(原视频FPS不变)
 // v6: 按钮中心点定位文字, 右下角FPS+NPU耗时叠加
-// v7: 4路不规则多边形蒙版(A/B/C/D), pt_in_poly过滤+draw_poly画线
-// v8: VIRAT_Datasets真实监控数据(65/44/18/24分钟), /userdata/videos/
+// v7: 4路不规则多边形蒙版(A/B/C/D)
+// v8: VIRAT_Datasets真实监控数据(65/44/18/24分钟)
+// v9: rot_write修复居中偏移, A通道独立draw_mask_A(可缩放), B/C/D帧→画布过滤
 
-#include <time.h>
 #include <sys/mman.h>
 #include <linux/input.h>
 #include <opencv2/core.hpp>
@@ -57,24 +57,25 @@ void pL(int bk,int lx,int ly,C4 c){int sx,sy;L2S(sx,sy,lx,ly);if(sx>=0&&sx<w&&sy
 void pS(int bk,int sx,int sy,C4 c){if(sx>=0&&sx<w&&sy>=0&&sy<h){auto*p=buf[bk]+sy*pitch+sx*4;p[0]=c.b;p[1]=c.g;p[2]=c.r;p[3]=c.a;}}
 void fL(int bk,int lx,int ly,int rw,int rh,C4 c){for(int y=0;y<rh;y++)for(int x=0;x<rw;x++)pL(bk,lx+x,ly+y,c);}
 void bL(int bk,int lx,int ly,int rw,int rh,C4 c,int t=3){for(int y=0;y<rh;y++)for(int x=0;x<rw;x++)if(x<t||x>=rw-t||y<t||y>=rh-t)pL(bk,lx+x,ly+y,c);}
-void rot_write(int bk,cv::Mat&img,int lw,int lh){
+	void rot_write(int bk,cv::Mat&img,int lw,int lh){
 	    if(img.empty()||img.cols<=0||img.rows<=0)return;
 	    int dw=lw,dh=img.rows*lw/img.cols;
 	    if(dh>lh){dh=lh;dw=img.cols*lh/img.rows;}
-	    // step=2 跳像素: 4x 加速
+	    int xo=(lw-dw)/2,yo=(lh-dh)/2; // 居中偏移, v4漏了导致A通道错位
 	    const int S=2;
 	    for(int ly=0;ly<dh;ly+=S){
 	        int sy0=ly*img.rows/dh;
 	        for(int lx=0;lx<dw;lx+=S){
 	            int sx0=lx*img.cols/dw;
 	            auto*src=img.ptr(sy0)+sx0*3;
-	            int px,py;L2S(px,py,lx,ly);
+	            int px,py;L2S(px,py,xo+lx,yo+ly);
 	            if(px<0||px>=w||py<0||py>=h)continue;
 	            auto*p=buf[bk]+py*pitch+px*4;
 	            p[0]=src[0];p[1]=src[1];p[2]=src[2];p[3]=0;
 	        }
 	    }
 	}
+
 };
 
 // FreeType 文字绘制: 在横屏逻辑坐标(lx,ly)绘制UTF-8字符串，字号px像素
@@ -159,6 +160,21 @@ void landscape(int&lx,int&ly){lx=y;ly=1079-x;}};
 	        }
 	    }
 	}
+	// A通道专用: 1920x1080画布上画蒙版轮廓(7px粗线, 坐标×1.506)
+	static void draw_mask_A(Drm&d,int bk,const std::vector<std::pair<int,int>>&poly){
+	    int n=poly.size();if(n<2)return;
+	    C4 yl=mk(255,255,0);
+	    float scl=1.506f;
+	    for(int i=0;i<n;i++){int j=(i+1)%n;
+	        int x1=poly[i].first*scl,y1=poly[i].second*scl,x2=poly[j].first*scl,y2=poly[j].second*scl;
+	        int steps=std::max(abs(x2-x1),abs(y2-y1));if(steps<1)steps=1;
+	        for(int s=0;s<=steps;s++){
+	            int x=x1+(x2-x1)*s/steps, y=y1+(y2-y1)*s/steps;
+	            d.fL(bk,x-3,y-3,7,7,yl);
+	        }
+	    }
+	}
+
 static bool is_v(int cls){return cls==1||cls==2||cls==3||cls==5||cls==6||cls==7;}
 static void draw_boxes(cv::Mat&f,const std::vector<DetectBox>&bx){for(auto&b:bx){int l=std::max(0,(int)b.left),t=std::max(0,(int)b.top),r=std::min(f.cols-1,(int)b.right),bt=std::min(f.rows-1,(int)b.bottom);unsigned char B,G,R;if(b.class_id==0){B=150;G=0;R=255;}else if(is_v(b.class_id)){B=255;G=80;R=0;}else{B=0;G=255;R=0;}for(int y=t;y<=bt;y++){auto*row=f.ptr(y);bool te=(y-t<4),be=(bt-y<4);for(int x=l;x<=r;x++){bool le=(x-l<4),re=(r-x<4);if((te||be)||(le||re)){row[x*3]=B;row[x*3+1]=G;row[x*3+2]=R;}}}}}
 
@@ -269,7 +285,20 @@ int main(){
             // NPU检测跳帧: 每3帧更新一次框位置, 但每帧都画(消除闪烁)
             det_skip=(det_skip+1)%3;
             if(det_skip==0){last_boxes.clear();auto t1=std::chrono::steady_clock::now();det.detect(frame,last_boxes);auto t2=std::chrono::steady_clock::now();det_ms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();snprintf(det_str,16,"NPU: %dms",det_ms);
-                if(!masks[cam].empty()){std::vector<DetectBox> filtered;for(auto&b:last_boxes){int cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;if(pt_in_poly(cx,cy,masks[cam]))filtered.push_back(b);}last_boxes=filtered;}
+                if(!masks[cam].empty()){
+                    std::vector<DetectBox> filtered;
+                    for(auto&b:last_boxes){
+                        int cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
+                        if(cam!=0){ // B/C/D: 帧→画布坐标转换
+                            int dww=1920,dhh=frame.rows*1920/frame.cols;
+                            if(dhh>1080){dhh=1080;dww=frame.cols*1080/frame.rows;}
+                            int xoo=(1920-dww)/2,yoo=(1080-dhh)/2;
+                            cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;
+                        } // A(cam==0): 保持简单对比
+                        if(pt_in_poly(cx,cy,masks[cam]))filtered.push_back(b);
+                    }
+                    last_boxes=filtered;
+                }
             }
             draw_boxes(frame,last_boxes);
             int bk=drm.fr^1;drm.clear(bk);
@@ -283,7 +312,8 @@ int main(){
             ft_text_right(drm,bk,1890,15,tb_time,26,mk(220,220,220));
             ft_text_right(drm,bk,1890,50,tb_date,20,mk(150,150,150));
             drm.rot_write(bk,frame,1920,1080);
-            if(!masks[cam].empty())draw_poly(drm,bk,masks[cam],mk(255,255,0));
+            if(cam==0&&!masks[0].empty())draw_mask_A(drm,bk,masks[0]);
+            else if(!masks[cam].empty())draw_poly(drm,bk,masks[cam],mk(255,255,0));
             // 右下角: FPS + 推理耗时
             ft_text_right(drm,bk,1890,1050,fps_str,22,mk(0,255,0));
             ft_text_right(drm,bk,1890,1025,det_str,22,mk(255,200,0));
