@@ -1,12 +1,12 @@
-// smart_camera GUI v6 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
+// smart_camera GUI v7 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
 // v1: 像素字体, 单通道
 // v2: 像素字体, 4通道选择, show_ret切换返回
 // v3: FreeType系统字体, 4通道选择, 直接返回按钮, 时间显示, 缓冲帧即时切换
 // v4: step=2跳像素渲染, NPU检测跳帧, usleep 3ms, 竖屏视频兼容
 // v5: 消除闪烁 + 帧定时调度(原视频FPS不变)
 // v6: 按钮中心点定位文字, 右下角FPS+NPU耗时叠加
+// v7: 4路不规则多边形蒙版(A/B/C/D), pt_in_poly过滤+draw_poly画线
 
-#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -17,6 +17,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include "detector.h"
 #include <xf86drm.h>
@@ -139,6 +140,25 @@ struct Touch{int fd,x,y,down,clicked;Touch():fd(-1),x(0),y(0),down(0),clicked(0)
 void poll(){clicked=0;input_event ev;while(read(fd,&ev,sizeof(ev))>0){if(ev.type==EV_ABS){if(ev.code==53)x=ev.value;else if(ev.code==54)y=ev.value;}else if(ev.type==EV_KEY&&ev.code==BTN_TOUCH){if(ev.value==1)down=1;else if(ev.value==0&&down){down=0;clicked=1;}}}}
 void landscape(int&lx,int&ly){lx=y;ly=1079-x;}};
 
+// 射线法: 判断点是否在多边形内
+	static bool pt_in_poly(int px,int py,const std::vector<std::pair<int,int>>&poly){
+	    bool inside=false;int n=poly.size();
+	    for(int i=0,j=n-1;i<n;j=i++){int xi=poly[i].first,yi=poly[i].second,xj=poly[j].first,yj=poly[j].second;
+	        if(((yi>py)!=(yj>py))&&(px<(xj-xi)*(py-yi)/(yj-yi)+xi))inside=!inside;}
+	    return inside;
+	}
+	// 在1920x1080画布上画多边形轮廓(步进法, 5px粗线)
+	void draw_poly(Drm&d,int bk,const std::vector<std::pair<int,int>>&poly,C4 c){
+	    int n=poly.size();if(n<2)return;
+	    for(int i=0;i<n;i++){int j=(i+1)%n;
+	        int x1=poly[i].first,y1=poly[i].second,x2=poly[j].first,y2=poly[j].second;
+	        int steps=std::max(abs(x2-x1),abs(y2-y1));if(steps<1)steps=1;
+	        for(int s=0;s<=steps;s++){
+	            int x=x1+(x2-x1)*s/steps, y=y1+(y2-y1)*s/steps;
+	            d.fL(bk,x-2,y-2,5,5,c);
+	        }
+	    }
+	}
 static bool is_v(int cls){return cls==1||cls==2||cls==3||cls==5||cls==6||cls==7;}
 static void draw_boxes(cv::Mat&f,const std::vector<DetectBox>&bx){for(auto&b:bx){int l=std::max(0,(int)b.left),t=std::max(0,(int)b.top),r=std::min(f.cols-1,(int)b.right),bt=std::min(f.rows-1,(int)b.bottom);unsigned char B,G,R;if(b.class_id==0){B=150;G=0;R=255;}else if(is_v(b.class_id)){B=255;G=80;R=0;}else{B=0;G=255;R=0;}for(int y=t;y<=bt;y++){auto*row=f.ptr(y);bool te=(y-t<4),be=(bt-y<4);for(int x=l;x<=r;x++){bool le=(x-l<4),re=(r-x<4);if((te||be)||(le||re)){row[x*3]=B;row[x*3+1]=G;row[x*3+2]=R;}}}}}
 
@@ -167,6 +187,12 @@ int main(){
     C4 cols[]={mk(200,40,40),mk(40,180,40),mk(40,100,220),mk(220,180,40)};
     int bw=800,bh=400,g=40,bx=(1920-bw*2-g)/2,by=(1080-bh*2-g)/2;
     struct{int x,y;}btn[4]={{bx,by},{bx+bw+g,by},{bx,by+bh+g},{bx+bw+g,by+bh+g}};
+    // 检测蒙版: 每路摄像头可定义不规则多边形, 只检测区域内目标
+    std::vector<std::pair<int,int>> masks[4];
+    masks[0]={{0,343},{726,275},{1278,330},{751,567},{0,434}}; // A通道蒙版
+    masks[1]={{0,349},{685,265},{1919,361},{1919,1079},{0,1079}}; // B通道蒙版
+    masks[2]={{458,0},{917,0},{1716,424},{1558,1079},{647,1079}}; // C通道蒙版
+    masks[3]={{0,493},{1333,448},{1919,879},{1919,1079},{0,1079}}; // D通道蒙版
     cv::Mat frame,fb0,fb1,fb2,fb3; int bg=0;
     {cv::Mat t;cap0.read(t);if(!t.empty())t.copyTo(fb0);
      cap1.read(t);if(!t.empty())t.copyTo(fb1);
@@ -242,7 +268,9 @@ int main(){
             f.copyTo(frame);
             // NPU检测跳帧: 每3帧更新一次框位置, 但每帧都画(消除闪烁)
             det_skip=(det_skip+1)%3;
-            if(det_skip==0){last_boxes.clear();auto t1=std::chrono::steady_clock::now();det.detect(frame,last_boxes);auto t2=std::chrono::steady_clock::now();det_ms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();snprintf(det_str,16,"NPU: %dms",det_ms);}
+            if(det_skip==0){last_boxes.clear();auto t1=std::chrono::steady_clock::now();det.detect(frame,last_boxes);auto t2=std::chrono::steady_clock::now();det_ms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();snprintf(det_str,16,"NPU: %dms",det_ms);
+                if(!masks[cam].empty()){std::vector<DetectBox> filtered;for(auto&b:last_boxes){int cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;if(pt_in_poly(cx,cy,masks[cam]))filtered.push_back(b);}last_boxes=filtered;}
+            }
             draw_boxes(frame,last_boxes);
             int bk=drm.fr^1;drm.clear(bk);
             // 时间: 每30帧更新字符串, 但每帧都渲染(不闪)
@@ -255,6 +283,7 @@ int main(){
             ft_text_right(drm,bk,1890,15,tb_time,26,mk(220,220,220));
             ft_text_right(drm,bk,1890,50,tb_date,20,mk(150,150,150));
             drm.rot_write(bk,frame,1920,1080);
+            if(!masks[cam].empty())draw_poly(drm,bk,masks[cam],mk(255,255,0));
             // 右下角: FPS + 推理耗时
             ft_text_right(drm,bk,1890,1050,fps_str,22,mk(0,255,0));
             ft_text_right(drm,bk,1890,1025,det_str,22,mk(255,200,0));
