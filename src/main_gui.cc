@@ -1,4 +1,4 @@
-// smart_camera GUI v7 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
+// smart_camera GUI v8 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
 // v1: 像素字体, 单通道
 // v2: 像素字体, 4通道选择, show_ret切换返回
 // v3: FreeType系统字体, 4通道选择, 直接返回按钮, 时间显示, 缓冲帧即时切换
@@ -6,8 +6,8 @@
 // v5: 消除闪烁 + 帧定时调度(原视频FPS不变)
 // v6: 按钮中心点定位文字, 右下角FPS+NPU耗时叠加
 // v7: 4路不规则多边形蒙版(A/B/C/D), pt_in_poly过滤+draw_poly画线
+// v8: VIRAT_Datasets真实监控数据(65/44/18/24分钟), /userdata/videos/
 
-#include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
 #include <linux/input.h>
@@ -176,10 +176,10 @@ int main(){
     printf("[DET] model loaded\n");fflush(stdout);
 
     cv::VideoCapture cap0,cap1,cap2,cap3;
-    cap0.open("/root/videos/a.mp4");printf("[c0] %d\n",cap0.isOpened());
-    cap1.open("/root/videos/b.mp4");printf("[c1] %d\n",cap1.isOpened());
-    cap2.open("/root/videos/c.mp4");printf("[c2] %d\n",cap2.isOpened());
-    cap3.open("/root/videos/d.mp4");printf("[c3] %d\n",cap3.isOpened());
+    cap0.open("/userdata/videos/a.mp4");printf("[c0] %d\n",cap0.isOpened());
+    cap1.open("/userdata/videos/b.mp4");printf("[c1] %d\n",cap1.isOpened());
+    cap2.open("/userdata/videos/c.mp4");printf("[c2] %d\n",cap2.isOpened());
+    cap3.open("/userdata/videos/d.mp4");printf("[c3] %d\n",cap3.isOpened());
     // 帧定时: 按25fps(40ms/帧)调度, 保证与原视频播放速度一致
     int frame_interval_us[4]={40000,40000,40000,40000};
 
