@@ -182,44 +182,31 @@ void landscape(int&lx,int&ly){lx=y;ly=1079-x;}};
 	    }
 	}
 
-// ======================== 车辆轨迹跟踪器 (v16: 状态机+多数投票+防抖+最短停留) ========================
-// 核心设计:
-//   1. 每辆车维护5帧历史(多数投票平滑, 消除边界抖动)
-//   2. 状态机: outside → pending_enter → inside → pending_exit → outside
-//   3. 防抖: 需连续N帧确认状态切换(DEBOUNCE_FRAMES=3)
-//   4. 最短停留: 进入后至少停留MIN_STAY_FRAMES帧才算有效驶出
-//   5. Track超时: 连续MAX_LOST_FRAMES帧未匹配则移除
-//   6. IOU匹配: 0.15阈值, 匈牙利贪心匹配
+// ======================== 车辆进出检测 (简化版: IOU跟踪 + 位置变化事件) ========================
+// 逻辑:
+//   1. IOU匹配维护每辆车的稳定ID
+//   2. 每辆车记录last_pos: 0=蒙版外, 1=蒙版内
+//   3. 已存在ID: last_pos从0→1触发"驶入", 从1→0触发"驶出"
+//   4. 新ID首次出现: 不触发事件(不知道它从哪里来)
+//   5. 检测丢失期间: last_pos保持不变, 重新匹配后比较变化
+//   6. 丢失超过MAX_LOST_FRAMES帧则删除track
 
-static constexpr int HISTORY_SIZE     = 5;   // 多数投票窗口
-static constexpr int DEBOUNCE_FRAMES  = 3;   // 状态切换需连续确认帧数
-static constexpr int MIN_STAY_FRAMES  = 8;   // 最短停留帧数(~2-3s, 取决于检测频率)
-static constexpr int MAX_LOST_FRAMES  = 15;  // track丢失后保留帧数(~5s)
-static constexpr float IOU_THRESHOLD  = 0.12f;
+static constexpr int MAX_LOST_FRAMES = 10;   // track丢失保留帧数
+static constexpr float IOU_THRESHOLD = 0.12f;
 
 struct CarTrack{
     int id;
     DetectBox box;
-    int state_hist[HISTORY_SIZE];  // 环形缓冲: 0=outside, 1=inside
-    int hist_idx;
-    bool confirmed_state;          // 已确认的当前状态(false=外, true=内)
-    int pending_cnt;               // 连续处于候选状态的帧数
-    bool pending_state;            // 候选新状态
-    int lost_frames;               // 连续未匹配帧数
-    int enter_frame;               // 确认进入时的全局帧号(用于最短停留判断)
-    int track_age;                 // track存活帧数
-    CarTrack():id(0),hist_idx(0),confirmed_state(false),pending_cnt(0),
-               pending_state(false),lost_frames(0),enter_frame(-1),track_age(0){
-        memset(state_hist,0,sizeof(state_hist));
-    }
+    int last_pos;      // 上一次位置: 0=外, 1=内
+    int lost_frames;   // 连续未匹配帧数
+    CarTrack():id(0),last_pos(0),lost_frames(0){}
 };
 
 struct CarTracker{
     std::vector<CarTrack> tracks;
     int next_id;
-    int frame_count;  // 全局帧计数器
 
-    CarTracker():next_id(1),frame_count(0){}
+    CarTracker():next_id(1){}
 
     float iou(const DetectBox&a,const DetectBox&b){
         float ax1=a.left,ay1=a.top,ax2=a.right,ay2=a.bottom;
@@ -233,20 +220,12 @@ struct CarTracker{
 
     struct Event{int id;bool is_enter;};
 
-    // 多数投票: 从历史窗口中统计inside票数
-    bool majority_inside(const CarTrack&t)const{
-        int votes=0;
-        for(int k=0;k<HISTORY_SIZE;k++) votes+=t.state_hist[k];
-        return votes>HISTORY_SIZE/2;
-    }
-
     void update(const std::vector<DetectBox>&dets,const std::vector<std::pair<int,int>>&mask,
                 const cv::Mat&frame,int cam_id,std::vector<Event>&events){
         events.clear();
-        frame_count++;
         int n=tracks.size(),m=dets.size();
 
-        // ---- 第1步: IOU贪心匹配(现有track→新检测) ----
+        // ---- 第1步: IOU贪心匹配 ----
         std::vector<bool>used(m,false);
         for(int i=0;i<n;i++){
             float best=IOU_THRESHOLD;
@@ -263,87 +242,47 @@ struct CarTracker{
             }else{
                 tracks[i].lost_frames++;
             }
-            tracks[i].track_age++;
         }
 
-        // ---- 第2步: 坐标转换参数(帧→1920×1080画布) ----
+        // ---- 第2步: 坐标转换参数 ----
         int dww=1920,dhh=frame.rows*1920/frame.cols;
         if(dhh>1080){dhh=1080;dww=frame.cols*1080/frame.rows;}
         int xoo=(1920-dww)/2,yoo=(1080-dhh)/2;
 
-        // ---- 第3步: 移除丢失过久的track ----
+        // ---- 第3步: 删除丢失过久的track ----
         tracks.erase(std::remove_if(tracks.begin(),tracks.end(),
             [](CarTrack&t){return t.lost_frames>MAX_LOST_FRAMES;}),
             tracks.end());
 
-        // ---- 第4步: 为新检测创建track ----
+        // ---- 第4步: 检查已匹配track的位置变化(丢失帧跳过) ----
+        for(auto&t:tracks){
+            if(t.lost_frames>0)continue; // 当前帧未匹配, 保持last_pos不变
+
+            int cx=(t.box.left+t.box.right)/2;
+            int cy=(t.box.top+t.box.bottom)/2;
+            if(cam_id!=0){cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;}
+            int cur_pos=pt_in_poly(cx,cy,mask)?1:0;
+
+            // 位置变化 → 触发事件
+            if(cur_pos!=t.last_pos){
+                events.push_back({t.id,cur_pos==1}); // 0→1=驶入(true), 1→0=驶出(false)
+                t.last_pos=cur_pos;
+            }
+        }
+
+        // ---- 第5步: 为新检测创建track(首次出现不触发事件) ----
         for(int j=0;j<m;j++){
             if(!used[j]){
                 CarTrack t;
                 t.id=next_id++;
                 t.box=dets[j];
+                t.lost_frames=0;
                 int cx=(dets[j].left+dets[j].right)/2;
                 int cy=(dets[j].top+dets[j].bottom)/2;
                 if(cam_id!=0){cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;}
-                bool inside=pt_in_poly(cx,cy,mask);
-                t.confirmed_state=inside;
-                // 用初始状态填满历史(避免新track抖动)
-                for(int k=0;k<HISTORY_SIZE;k++)t.state_hist[k]=inside?1:0;
+                t.last_pos=pt_in_poly(cx,cy,mask)?1:0;
+                // 新ID: 记录位置但不触发事件
                 tracks.push_back(t);
-            }
-        }
-
-        // ---- 第5步: 状态机更新(仅处理未丢失的track) ----
-        for(auto&t:tracks){
-            if(t.lost_frames>0)continue; // 丢帧的track保持状态不变
-
-            // 计算当前帧中心点是否在蒙版内
-            int cx=(t.box.left+t.box.right)/2;
-            int cy=(t.box.top+t.box.bottom)/2;
-            if(cam_id!=0){cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;}
-            bool raw_inside=pt_in_poly(cx,cy,mask);
-
-            // 写入环形历史缓冲
-            t.state_hist[t.hist_idx]=raw_inside?1:0;
-            t.hist_idx=(t.hist_idx+1)%HISTORY_SIZE;
-
-            // 多数投票 → 平滑状态
-            bool smoothed=raw_inside; // 默认用原始值
-            if(t.track_age>=HISTORY_SIZE){
-                smoothed=majority_inside(t);
-            }
-
-            // ---- 防抖状态机 ----
-            if(smoothed!=t.confirmed_state){
-                if(smoothed==t.pending_state){
-                    // 连续处于候选状态
-                    t.pending_cnt++;
-                    if(t.pending_cnt>=DEBOUNCE_FRAMES){
-                        // ★ 状态切换确认 ★
-                        if(smoothed && !t.confirmed_state){
-                            // outside → inside: ENTER
-                            t.confirmed_state=true;
-                            t.enter_frame=frame_count;
-                            t.pending_cnt=0;
-                            events.push_back({t.id,true});
-                        }else if(!smoothed && t.confirmed_state){
-                            // inside → outside: 需满足最短停留
-                            t.confirmed_state=false;
-                            t.pending_cnt=0;
-                            if(t.enter_frame>=0 && (frame_count-t.enter_frame)>=MIN_STAY_FRAMES){
-                                events.push_back({t.id,false});
-                            }
-                            // 不足最短停留 → 忽略此次离开(路过车辆)
-                        }
-                    }
-                }else{
-                    // 候选状态切换, 重新计数
-                    t.pending_state=smoothed;
-                    t.pending_cnt=1;
-                }
-            }else{
-                // 状态一致, 清零待确认计数
-                t.pending_cnt=0;
             }
         }
     }
@@ -430,7 +369,21 @@ int main(){
                         {std::vector<DetectBox> veh;for(auto&b:bbx)if(is_v(b.class_id))veh.push_back(b);
                          std::vector<CarTracker::Event> evs;
                          car_trackers[c].update(veh,masks[c],t,c,evs);
+                         // 事件立即输出(所有通道)
                          for(auto&ev:evs)printf("[event] %c区 %s ID:%d\n",'A'+c,ev.is_enter?"驶入":"驶出",ev.id);
+                         // A通道: 每2秒打印一次所有track状态
+                         if(c==0){
+                             static auto last_summary=std::chrono::steady_clock::now();
+                             auto now=std::chrono::steady_clock::now();
+                             if(std::chrono::duration_cast<std::chrono::milliseconds>(now-last_summary).count()>=2000){
+                                 last_summary=now;
+                                 printf("[A区] %d辆车: ",(int)car_trackers[0].tracks.size());
+                                 for(auto&tr:car_trackers[0].tracks)
+                                     printf("ID%d=%d ",tr.id,tr.last_pos);
+                                 printf("\n");
+                             }
+                         }
+                         fflush(stdout);
                         }
                         chan_car[c]=cc;
                         snprintf(chan_info[c],32,"数量:%d/%d",cc,chan_cap[c]);
