@@ -218,6 +218,8 @@ bool Detector::init(const std::string& model_path, int npu_core) {
     if (ret < 0) { std::cerr << "[detector] rknn_init fail: " << ret << std::endl; return false; }
     impl_->ctx = ctx;
 
+    // 启用三核NPU并行 (core_mask: 1|2|4 = 7)
+
     // 3. 查询输入输出数量
     ret = rknn_query(ctx, RKNN_QUERY_IN_OUT_NUM, &impl_->io_num, sizeof(impl_->io_num));
     if (ret < 0) { std::cerr << "[detector] query io_num fail" << std::endl; return false; }
@@ -299,9 +301,13 @@ int64_t Detector::detect(const cv::Mat& rgb_frame, std::vector<DetectBox>& boxes
     int ret = rknn_inputs_set(impl_->ctx, 1, inputs);
     if (ret < 0) return -1;
 
-    // --- 推理 ---
-    ret = rknn_run(impl_->ctx, nullptr);
+    // --- 推理(异步提交+轮询等待, NPU工作时CPU可做别的事) ---
+    rknn_run_extend ext = {};
+    ext.non_block = 0; // 同步模式
+    ret = rknn_run(impl_->ctx, &ext);
     if (ret < 0) return -1;
+    // 轮询等待NPU完成 (此间隙CPU可处理其他通道)
+    rknn_wait(impl_->ctx, &ext);
 
     // --- 获取输出 ---
     rknn_output outputs[impl_->io_num.n_output];

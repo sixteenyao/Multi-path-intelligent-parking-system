@@ -5,3 +5,11 @@ sysroot/
 tools/mediamtx
 *.rknn
 .vscode/
+
+# 密钥/证书 — 禁止入库(mediamtx自签名证书等由运行时自动生成)
+auto.key
+auto.crt
+*.key
+*.crt
+*.pem
+.ossutilconfig
