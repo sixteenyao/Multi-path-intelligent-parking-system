@@ -1,0 +1,1116 @@
+// smart_camera GUI v9 — 4路后台播放+触摸+DRM+FreeType系统字体+中文UI
+// v1: 像素字体, 单通道
+// v2: 像素字体, 4通道选择, show_ret切换返回
+// v3: FreeType系统字体, 4通道选择, 直接返回按钮, 时间显示, 缓冲帧即时切换
+// v4: step=2跳像素渲染, NPU检测跳帧, usleep 3ms, 竖屏视频兼容
+// v5: 消除闪烁 + 帧定时调度(原视频FPS不变)
+// v6: 按钮中心点定位文字, 右下角FPS+NPU耗时叠加
+// v7: 4路不规则多边形蒙版(A/B/C/D)
+// v8: VIRAT_Datasets真实监控数据(65/44/18/24分钟)
+// v9: rot_write修复居中偏移, A通道独立draw_mask_A(可缩放), B/C/D帧→画布过滤
+
+#include <iostream>
+#include <cstring>
+#include <cstdio>
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/stat.h>
+#include <linux/input.h>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <poll.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <algorithm>
+#include <chrono>
+#include "detector.h"
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#include <drm/drm_fourcc.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
+
+typedef struct{unsigned char b,g,r,a;}C4;
+static C4 mk(unsigned char r,unsigned char g,unsigned char b){return{b,g,r,0};}
+
+// ======================== FreeType 系统字体 ========================
+static FT_Library ft_lib;
+static FT_Face ft_face_cn; // 中文字体 Noto Sans SC
+static FT_Face ft_face_en; // 英文字体 Bitstream Vera
+static void ft_init(){
+    if(FT_Init_FreeType(&ft_lib)){printf("[FT] init failed\n");return;}
+    bool cn_ok=(FT_New_Face(ft_lib,"/usr/share/fonts/noto-sans-sc/NotoSansSC-Regular.otf",0,&ft_face_cn)==0);
+    bool en_ok=(FT_New_Face(ft_lib,"/usr/share/fonts/ttf-bitstream-vera/Vera.ttf",0,&ft_face_en)==0);
+    printf("[FT] CN:%s EN:%s\n",cn_ok?"NotoSansSC":"none",en_ok?"Vera":"none");fflush(stdout);
+}
+
+struct Drm{int fd=0,fr=0,w,h,pitch,size;uint32_t fb[2],crtc,conn;drmModeModeInfo mode;unsigned char*buf[2];
+int init(){fd=open("/dev/dri/card0",O_RDWR);if(fd<0)return-1;
+auto*R=drmModeGetResources(fd);
+for(int i=0;i<R->count_connectors;i++){auto*c=drmModeGetConnector(fd,R->connectors[i]);if(c&&c->connection==DRM_MODE_CONNECTED&&c->count_modes>0){conn=c->connector_id;mode=c->modes[0];auto*e=drmModeGetEncoder(fd,c->encoder_id);if(e){crtc=e->crtc_id;drmModeFreeEncoder(e);}drmModeFreeConnector(c);break;}drmModeFreeConnector(c);}drmModeFreeResources(R);
+w=mode.hdisplay;h=mode.vdisplay;
+for(int b=0;b<2;b++){drm_mode_create_dumb c={};c.width=w;c.height=h;c.bpp=32;drmIoctl(fd,DRM_IOCTL_MODE_CREATE_DUMB,&c);if(b==0){pitch=c.pitch;size=c.size;}uint32_t H[4]={(uint32_t)c.handle,0u,0u,0u},P[4]={(uint32_t)c.pitch,0u,0u,0u},O[4]={0u};drmModeAddFB2(fd,w,h,DRM_FORMAT_XRGB8888,H,P,O,&fb[b],0);drm_mode_map_dumb m={};m.handle=c.handle;drmIoctl(fd,DRM_IOCTL_MODE_MAP_DUMB,&m);buf[b]=(unsigned char*)mmap(0,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);}
+drmModeSetCrtc(fd,crtc,fb[0],0,0,&conn,1,&mode);return 0;}
+void flip(){int bk=fr^1;drmModeSetCrtc(fd,crtc,fb[bk],0,0,&conn,1,&mode);fr=bk;}
+void clear(int bk){memset(buf[bk],0,size);}
+void L2S(int&sx,int&sy,int lx,int ly){sx=1079-ly;sy=lx;}
+void pL(int bk,int lx,int ly,C4 c){int sx,sy;L2S(sx,sy,lx,ly);if(sx>=0&&sx<w&&sy>=0&&sy<h){auto*p=buf[bk]+sy*pitch+sx*4;p[0]=c.b;p[1]=c.g;p[2]=c.r;p[3]=c.a;}}
+void pS(int bk,int sx,int sy,C4 c){if(sx>=0&&sx<w&&sy>=0&&sy<h){auto*p=buf[bk]+sy*pitch+sx*4;p[0]=c.b;p[1]=c.g;p[2]=c.r;p[3]=c.a;}}
+void fL(int bk,int lx,int ly,int rw,int rh,C4 c){for(int y=0;y<rh;y++)for(int x=0;x<rw;x++)pL(bk,lx+x,ly+y,c);}
+void bL(int bk,int lx,int ly,int rw,int rh,C4 c,int t=3){for(int y=0;y<rh;y++)for(int x=0;x<rw;x++)if(x<t||x>=rw-t||y<t||y>=rh-t)pL(bk,lx+x,ly+y,c);}
+	void rot_write(int bk,cv::Mat&img,int lw,int lh){
+	    if(img.empty()||img.cols<=0||img.rows<=0)return;
+	    int dw=lw,dh=img.rows*lw/img.cols;
+	    if(dh>lh){dh=lh;dw=img.cols*lh/img.rows;}
+	    int xo=(lw-dw)/2,yo=(lh-dh)/2; // 居中偏移, v4漏了导致A通道错位
+	    const int S=2;
+	    for(int ly=0;ly<dh;ly+=S){
+	        int sy0=ly*img.rows/dh;
+	        for(int lx=0;lx<dw;lx+=S){
+	            int sx0=lx*img.cols/dw;
+	            auto*src=img.ptr(sy0)+sx0*3;
+	            int px,py;L2S(px,py,xo+lx,yo+ly);
+	            if(px<0||px>=w||py<0||py>=h)continue;
+	            auto*p=buf[bk]+py*pitch+px*4;
+	            p[0]=src[0];p[1]=src[1];p[2]=src[2];p[3]=0;
+	        }
+	    }
+	}
+
+};
+
+// FreeType 文字绘制: 在横屏逻辑坐标(lx,ly)绘制UTF-8字符串，字号px像素
+static void ft_text(Drm& d,int bk,int lx,int ly,const char*u8,int px,C4 clr){
+    int sx,sy; d.L2S(sx,sy,lx,ly);
+    for(const char*p=u8;*p;){
+        unsigned w=0;bool is_ascii=false;
+        if((unsigned char)*p<128){w=*p;p++;is_ascii=true;}
+        else{int len=0;if((*p&0xE0)==0xC0)len=2;else if((*p&0xF0)==0xE0)len=3;else if((*p&0xF8)==0xF0)len=4;
+            unsigned char b[4]={};for(int j=0;j<len;j++)b[j]=*p++;
+            if(len==2)w=((b[0]&0x1F)<<6)|(b[1]&0x3F);
+            else if(len==3)w=((b[0]&0x0F)<<12)|((b[1]&0x3F)<<6)|(b[2]&0x3F);
+            else if(len==4)w=((b[0]&0x07)<<18)|((b[1]&0x3F)<<12)|((b[2]&0x3F)<<6)|(b[3]&0x3F);
+        }
+        FT_Face face=is_ascii&&ft_face_en?ft_face_en:ft_face_cn;
+        if(!face)return;
+        FT_Set_Pixel_Sizes(face,0,px);
+        FT_Load_Char(face,w,FT_LOAD_RENDER);
+        auto*bm=&face->glyph->bitmap;
+        int gx=sx+face->glyph->bitmap_left;
+        int gy=sy-face->glyph->bitmap_top;
+        for(unsigned ry=0;ry<bm->rows;ry++)for(unsigned rx=0;rx<bm->width;rx++){
+            unsigned char a=bm->buffer[ry*bm->pitch+rx];
+            if(a>128)d.pS(bk,gx-(int)ry,gy+(int)rx,clr);
+        }
+        sx-=face->glyph->advance.y>>6;
+        sy+=face->glyph->advance.x>>6;
+    }
+}
+
+// 测量UTF-8字符串宽度(像素)
+static int ft_width(const char*u8,int px){
+    int w=0;
+    for(const char*p=u8;*p;){
+        unsigned cw=0;bool is_ascii=false;
+        if((unsigned char)*p<128){cw=*p;p++;is_ascii=true;}
+        else{int len=0;if((*p&0xE0)==0xC0)len=2;else if((*p&0xF0)==0xE0)len=3;else if((*p&0xF8)==0xF0)len=4;
+            unsigned char b[4]={};for(int j=0;j<len;j++)b[j]=*p++;
+            if(len==2)cw=((b[0]&0x1F)<<6)|(b[1]&0x3F);
+            else if(len==3)cw=((b[0]&0x0F)<<12)|((b[1]&0x3F)<<6)|(b[2]&0x3F);
+            else if(len==4)cw=((b[0]&0x07)<<18)|((b[1]&0x3F)<<12)|((b[2]&0x3F)<<6)|(b[3]&0x3F);
+        }
+        FT_Face face=is_ascii&&ft_face_en?ft_face_en:ft_face_cn;
+        if(!face)return 0;
+        FT_Set_Pixel_Sizes(face,0,px);
+        FT_Load_Char(face,cw,FT_LOAD_RENDER);
+        w+=face->glyph->advance.x>>6;
+    }
+    return w;
+}
+
+// 居中绘制文字 (水平+垂直居中)
+static void ft_text_center(Drm& d,int bk,int lx,int ly,int bw,int bh,const char*u8,int px,C4 clr){
+    int tw=ft_width(u8,px);
+    ft_text(d,bk,lx+(bw-tw)/2,ly+bh/2,u8,px,clr);
+}
+
+// 右对齐绘制文字
+static void ft_text_right(Drm& d,int bk,int rx,int ly,const char*u8,int px,C4 clr){
+    int tw=ft_width(u8,px);
+    ft_text(d,bk,rx-tw,ly,u8,px,clr);
+}
+
+struct Touch{int fd,x,y,down,clicked;Touch():fd(-1),x(0),y(0),down(0),clicked(0){fd=open("/dev/input/event2",O_RDONLY|O_NONBLOCK);}
+void poll(){clicked=0;input_event ev;while(read(fd,&ev,sizeof(ev))>0){if(ev.type==EV_ABS){if(ev.code==53)x=ev.value;else if(ev.code==54)y=ev.value;}else if(ev.type==EV_KEY&&ev.code==BTN_TOUCH){if(ev.value==1)down=1;else if(ev.value==0&&down){down=0;clicked=1;}}}}
+void landscape(int&lx,int&ly){lx=y;ly=1079-x;}};
+
+// 射线法: 判断点是否在多边形内
+	static bool pt_in_poly(int px,int py,const std::vector<std::pair<int,int>>&poly){
+	    bool inside=false;int n=poly.size();
+	    for(int i=0,j=n-1;i<n;j=i++){int xi=poly[i].first,yi=poly[i].second,xj=poly[j].first,yj=poly[j].second;
+	        if(((yi>py)!=(yj>py))&&(px<(xj-xi)*(py-yi)/(yj-yi)+xi))inside=!inside;}
+	    return inside;
+	}
+// 判断点是否在一组多边形中的任意一个内
+static bool pt_in_any_poly(int px,int py,const std::vector<std::vector<std::pair<int,int>>>&polys){
+    for(auto&p:polys)if(pt_in_poly(px,py,p))return true;
+    return false;
+}
+	// 在1920x1080画布上画多边形轮廓(步进法, 5px粗线)
+	void draw_poly(Drm&d,int bk,const std::vector<std::pair<int,int>>&poly,C4 c){
+	    int n=poly.size();if(n<2)return;
+	    for(int i=0;i<n;i++){int j=(i+1)%n;
+	        int x1=poly[i].first,y1=poly[i].second,x2=poly[j].first,y2=poly[j].second;
+	        int steps=std::max(abs(x2-x1),abs(y2-y1));if(steps<1)steps=1;
+	        for(int s=0;s<=steps;s++){
+	            int x=x1+(x2-x1)*s/steps, y=y1+(y2-y1)*s/steps;
+	            d.fL(bk,x-2,y-2,5,5,c);
+	        }
+	    }
+	}
+// 绘制一组多边形
+static void draw_all_polys(Drm&d,int bk,const std::vector<std::vector<std::pair<int,int>>>&polys,C4 c){
+    for(auto&p:polys)draw_poly(d,bk,p,c);
+}
+	// A通道专用: 1920x1080画布上画蒙版轮廓(7px粗线, 坐标×1.506)
+	static void draw_mask_A(Drm&d,int bk,const std::vector<std::pair<int,int>>&poly){
+	    int n=poly.size();if(n<2)return;
+	    C4 yl=mk(255,255,0);
+	    float scl=1.506f;
+	    for(int i=0;i<n;i++){int j=(i+1)%n;
+	        int x1=poly[i].first*scl,y1=poly[i].second*scl,x2=poly[j].first*scl,y2=poly[j].second*scl;
+	        int steps=std::max(abs(x2-x1),abs(y2-y1));if(steps<1)steps=1;
+	        for(int s=0;s<=steps;s++){
+	            int x=x1+(x2-x1)*s/steps, y=y1+(y2-y1)*s/steps;
+	            d.fL(bk,x-3,y-3,7,7,yl);
+	        }
+	    }
+	}
+
+// ======================== 车辆进出检测 (简化版: IOU跟踪 + 位置变化事件) ========================
+// 逻辑:
+//   1. IOU匹配维护每辆车的稳定ID
+//   2. 每辆车记录last_pos: 0=蒙版外, 1=蒙版内
+//   3. 已存在ID: last_pos从0→1触发"驶入", 从1→0触发"驶出"
+//   4. 新ID首次出现: 不触发事件(不知道它从哪里来)
+//   5. 检测丢失期间: last_pos保持不变, 重新匹配后比较变化
+//   6. 丢失超过MAX_LOST_FRAMES帧则删除track
+//   7. 同一ID最多触发1次驶入+1次驶出, 防止重复事件
+
+static constexpr int MAX_LOST_FRAMES = 10;   // track丢失保留帧数
+static constexpr float IOU_THRESHOLD = 0.12f;
+
+struct CarTrack{
+    int id;
+    DetectBox box;
+    int last_pos;      // 上一次位置: 0=外, 1=内
+    int lost_frames;   // 连续未匹配帧数
+    bool enter_done;   // 已触发驶入事件
+    bool exit_done;    // 已触发驶出事件
+    time_t viol_start; // 违规停车开始时间(0=未违规)
+    int viol_secs;     // 违规阈值秒数(随机120-300)
+    bool viol_done;    // 已触发违规告警
+    CarTrack():id(0),last_pos(0),lost_frames(0),enter_done(false),exit_done(false),viol_start(0),viol_secs(0),viol_done(false){}
+};
+
+struct CarTracker{
+    std::vector<CarTrack> tracks;
+    int next_id;
+
+    CarTracker():next_id(1){}
+
+    float iou(const DetectBox&a,const DetectBox&b){
+        float ax1=a.left,ay1=a.top,ax2=a.right,ay2=a.bottom;
+        float bx1=b.left,by1=b.top,bx2=b.right,by2=b.bottom;
+        float ix1=std::max(ax1,bx1),iy1=std::max(ay1,by1);
+        float ix2=std::min(ax2,bx2),iy2=std::min(ay2,by2);
+        float iw=std::max(0.f,ix2-ix1),ih=std::max(0.f,iy2-iy1),ia=iw*ih;
+        float ua=(ax2-ax1)*(ay2-ay1)+(bx2-bx1)*(by2-by1)-ia;
+        return ua>0?ia/ua:0;
+    }
+
+    struct Event{int id;int type;}; // type: 1=驶入 0=驶出 2=违规停车
+
+    void update(const std::vector<DetectBox>&dets,const std::vector<std::vector<std::pair<int,int>>>&mask_list,
+                const std::vector<std::vector<std::pair<int,int>>>&park_list,
+                const cv::Mat&frame,int cam_id,std::vector<Event>&events){
+        events.clear();
+        int n=tracks.size(),m=dets.size();
+
+        // ---- 第1步: IOU贪心匹配 ----
+        std::vector<bool>used(m,false);
+        for(int i=0;i<n;i++){
+            float best=IOU_THRESHOLD;
+            int bj=-1;
+            for(int j=0;j<m;j++){
+                if(used[j])continue;
+                float ii=iou(tracks[i].box,dets[j]);
+                if(ii>best){best=ii;bj=j;}
+            }
+            if(bj>=0){
+                used[bj]=true;
+                tracks[i].box=dets[bj];
+                tracks[i].lost_frames=0;
+            }else{
+                tracks[i].lost_frames++;
+            }
+        }
+
+        // ---- 第2步: 坐标转换参数 ----
+        int dww=1920,dhh=frame.rows*1920/frame.cols;
+        if(dhh>1080){dhh=1080;dww=frame.cols*1080/frame.rows;}
+        int xoo=(1920-dww)/2,yoo=(1080-dhh)/2;
+
+        // ---- 第3步: 删除丢失过久的track ----
+        tracks.erase(std::remove_if(tracks.begin(),tracks.end(),
+            [](CarTrack&t){return t.lost_frames>MAX_LOST_FRAMES;}),
+            tracks.end());
+
+        // ---- 第4步: 检查已匹配track的位置变化(丢失帧跳过) ----
+        for(auto&t:tracks){
+            if(t.lost_frames>0)continue; // 当前帧未匹配, 保持last_pos不变
+
+            int cx=(t.box.left+t.box.right)/2;
+            int cy=(t.box.top+t.box.bottom)/2;
+            if(cam_id!=0){cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;}
+            int cur_pos=pt_in_any_poly(cx,cy,mask_list)?1:0;
+
+            // 位置变化 → 触发事件(同一ID最多1次驶入+1次驶出)
+            if(cur_pos!=t.last_pos){
+                if(cur_pos==1&&!t.enter_done){                   // 0→1: 驶入
+                    events.push_back({t.id,1});
+                    t.enter_done=true;
+                }else if(cur_pos==0&&t.enter_done&&!t.exit_done){// 1→0: 驶出(必须先驶入过)
+                    events.push_back({t.id,0});
+                    t.exit_done=true;
+                }
+                t.last_pos=cur_pos;
+            }
+            // 违规停车检测: 在黄色蒙版内但不在紫色停车位内
+            if(cur_pos==1&&!park_list.empty()){
+                bool in_spot=pt_in_any_poly(cx,cy,park_list);
+                if(!in_spot){
+                    time_t now_t=time(0);
+                    if(t.viol_start==0){t.viol_start=now_t;t.viol_secs=120+rand()%181;t.viol_done=false;}
+                    else if(!t.viol_done&&now_t-t.viol_start>=t.viol_secs){
+                        events.push_back({t.id,2});t.viol_done=true;
+                    }
+                }else{t.viol_start=0;} // 进入停车位, 重置
+            }else{t.viol_start=0;} // 不在黄色蒙版, 重置
+        }
+
+        // ---- 第5步: 为新检测创建track(首次出现不触发事件) ----
+        for(int j=0;j<m;j++){
+            if(!used[j]){
+                CarTrack t;
+                t.id=next_id++;
+                t.box=dets[j];
+                t.lost_frames=0;
+                int cx=(dets[j].left+dets[j].right)/2;
+                int cy=(dets[j].top+dets[j].bottom)/2;
+                if(cam_id!=0){cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;}
+                t.last_pos=pt_in_any_poly(cx,cy,mask_list)?1:0;
+                // 新ID: 记录位置但不触发事件
+                tracks.push_back(t);
+            }
+        }
+    }
+};
+// 获取毫秒时间戳(epoch ms)
+static int64_t ms_now(){auto t=std::chrono::system_clock::now();return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();}
+// 保存事件图片到本地(车辆截图+场景标注)
+static void save_event_imgs(const cv::Mat&frame,const DetectBox&box,int chan,int id,int64_t epoch_ms){
+    if(frame.empty())return;
+    time_t sec=epoch_ms/1000;int ms=epoch_ms%1000;
+    struct tm*lt=localtime(&sec);
+    char dirname[64],date[16];
+    snprintf(date,16,"%04d%02d%02d",lt->tm_year+1900,lt->tm_mon+1,lt->tm_mday);
+    snprintf(dirname,64,"%04d%02d%02d%02d%02d%02d%03d",
+        lt->tm_year+1900,lt->tm_mon+1,lt->tm_mday,lt->tm_hour,lt->tm_min,lt->tm_sec,ms);
+    char path[256],tmp[256];
+    snprintf(tmp,256,"/tmp/oss_ready/%s",date);mkdir(tmp,0755);
+    snprintf(path,256,"/tmp/oss_ready/%s/%s",date,dirname);mkdir(path,0755);
+    // 1. 车辆截图(检测框区域)
+    int x1=std::max(0,(int)box.left),y1=std::max(0,(int)box.top);
+    int x2=std::min(frame.cols-1,(int)box.right),y2=std::min(frame.rows-1,(int)box.bottom);
+    cv::Rect roi(x1,y1,x2-x1,y2-y1);
+    if(roi.width>0&&roi.height>0){
+        cv::Mat crop=frame(roi).clone();
+        char fname[256];snprintf(fname,256,"%s/vehicle.jpg",path);
+        cv::imwrite(fname,crop);
+    }
+    // 2. 场景图(手动画红色粗框, 绕过cv::rectangle)
+    cv::Mat scene=frame.clone();
+    // 手动绘制红色边框(BGR: p[2]=255红色, 每像素3字节)
+    int thickness=6;
+    for(int dy=0;dy<thickness;dy++){
+        for(int x=x1;x<=x2;x++){ // 上下横线
+            if(y1+dy>=0&&y1+dy<scene.rows){auto*p=scene.ptr(y1+dy)+x*3;p[2]=255;}
+            if(y2-dy>=0&&y2-dy<scene.rows){auto*p=scene.ptr(y2-dy)+x*3;p[2]=255;}
+        }
+        for(int y=y1;y<=y2;y++){ // 左右竖线
+            if(x1+dy>=0&&x1+dy<scene.cols){auto*p=scene.ptr(y)+(x1+dy)*3;p[2]=255;}
+            if(x2-dy>=0&&x2-dy<scene.cols){auto*p=scene.ptr(y)+(x2-dy)*3;p[2]=255;}
+        }
+    }
+    char fname2[256];snprintf(fname2,256,"%s/scene.jpg",path);
+    cv::imwrite(fname2,scene);
+}
+static void add_event(std::vector<std::string>&log,int chan,int type,int id,int64_t epoch_ms,const cv::Mat&frame,const DetectBox&box){
+    time_t sec=epoch_ms/1000;int msec=epoch_ms%1000;
+    struct tm*lt=localtime(&sec);
+    char buf[160];
+    const char*msg=type==1?"驶入":type==0?"驶出":"疑似违规停车";
+    // 格式: 时间戳ms|A区 - ID为x的车辆xxx 2026.07.07 13:28:14.123
+    snprintf(buf,160,"%lld|%c区 - ID为%d的车辆%s %04d.%02d.%02d %02d:%02d:%02d.%03d",
+        (long long)epoch_ms,'A'+chan,id,msg,
+        lt->tm_year+1900,lt->tm_mon+1,lt->tm_mday,
+        lt->tm_hour,lt->tm_min,lt->tm_sec,msec);
+    log.push_back(buf);if(log.size()>500)log.erase(log.begin());
+    save_event_imgs(frame,box,chan,id,epoch_ms);
+    system("aplay -q /root/notify.wav &");
+}
+// 长文本自动换行(prefix为每行前缀, 26中文字宽)
+static void llm_add_wrapped(std::vector<std::string>&log,const char*text,const char*prefix="[AI] "){
+    const int MAXW=26*2;
+    std::string line=prefix;int line_w=0;
+    for(const char*p=text;*p;){
+        int clen=1;bool ascii=((unsigned char)*p<128);
+        if(!ascii){if((*p&0xE0)==0xC0)clen=2;else if((*p&0xF0)==0xE0)clen=3;else clen=4;}
+        int cw=ascii?1:2;
+        if(line_w+cw>MAXW){log.push_back(line);line=prefix;line_w=0;}
+        line.append(p,clen);p+=clen;line_w+=cw;
+    }
+    if(line_w>0)log.push_back(line);
+}
+// 异步调用LLM: 写问题到文件, Python后台读取并回答
+static void llm_ask(const char*q){
+    remove("/tmp/llm_ans.txt");
+    FILE*fp=fopen("/tmp/llm_req.txt","w");if(fp){fprintf(fp,"%s",q);fclose(fp);}
+    system("/root/llm_async.sh &");
+}
+// 检查LLM回复(每帧调用, 非阻塞)
+static void llm_check(std::vector<std::string>&log){
+    FILE*fp=fopen("/tmp/llm_ans.txt","r");
+    if(!fp)return;
+    fseek(fp,0,SEEK_END);long sz=ftell(fp);
+    if(sz==0){fclose(fp);return;}
+    fseek(fp,0,SEEK_SET);
+    char*buf=(char*)malloc(sz+1);fread(buf,1,sz,fp);buf[sz]=0;fclose(fp);
+    // 删除文件表示已读
+    remove("/tmp/llm_ans.txt");
+    while(sz>0&&(buf[sz-1]=='\n'||buf[sz-1]=='\r'))buf[--sz]=0;
+    if(sz>0)llm_add_wrapped(log,buf);
+    free(buf);
+}
+// OSS上传: 每个事件一个毫秒时间戳文件夹, 每60s增量上传, 支持断点续传
+static void oss_upload(std::vector<std::string>&log){
+    static int last_cnt=0; // 已上传条数
+    static time_t last_chk=0;
+    time_t now_t=time(0);
+    if(now_t-last_chk<60)return;
+    last_chk=now_t;
+    int total=log.size();
+    if(total<=last_cnt)return;
+    // 1. 重试断网pending
+    system("bash -c 'for d in /tmp/oss_pending/*/; do [ -d \"$d\" ] && ossutil cp -r \"$d\" oss://smartcamera-logs/ -f && rm -rf \"$d\"; done' >/dev/null 2>&1 &");
+    // 2. 为每个新事件创建毫秒文件夹 + all_log批次
+    mkdir("/tmp/oss_ready",0755);
+    for(int i=last_cnt;i<total;i++){
+        const char*s=log[i].c_str();
+        long long ems=atoll(s);
+        time_t sec=ems/1000;int ms=ems%1000;
+        struct tm*lt=localtime(&sec);
+        // 毫秒文件夹名
+        char dirname[64];
+        snprintf(dirname,64,"%04d%02d%02d%02d%02d%02d%03d",
+            lt->tm_year+1900,lt->tm_mon+1,lt->tm_mday,lt->tm_hour,lt->tm_min,lt->tm_sec,ms);
+        const char*pipe=strchr(s,'|');
+        const char*text=pipe?pipe+1:s;
+        // 本地: /tmp/oss_ready/YYYYMMDD/YYYYMMDDHHMMSSmmm/
+        char local_path[256],date[16];
+        snprintf(date,16,"%04d%02d%02d",lt->tm_year+1900,lt->tm_mon+1,lt->tm_mday);
+        snprintf(local_path,256,"/tmp/oss_ready/%s/%s",date,dirname);
+        char datedir[128];snprintf(datedir,128,"/tmp/oss_ready/%s",date);mkdir(datedir,0755);
+        mkdir(local_path,0755);
+        char logpath[256];snprintf(logpath,256,"%s/log.txt",local_path);
+        FILE*fp=fopen(logpath,"w");
+        if(fp){fprintf(fp,"%s\n",text);fclose(fp);}
+    }
+    // 3. 写all_log批次文件(HHMMSS.txt, 上传时间命名)
+    if(total>last_cnt){
+        time_t now_t=time(0);struct tm*tn=localtime(&now_t);
+        char batch_fn[64],batch_date[16];
+        snprintf(batch_fn,64,"%02d%02d%02d.txt",tn->tm_hour,tn->tm_min,tn->tm_sec);
+        snprintf(batch_date,16,"%04d%02d%02d",tn->tm_year+1900,tn->tm_mon+1,tn->tm_mday);
+        char batch_path[256];snprintf(batch_path,256,"/tmp/oss_ready/%s/all_log/%s",batch_date,batch_fn);
+        char batch_dir[200];snprintf(batch_dir,200,"/tmp/oss_ready/%s/all_log",batch_date);mkdir(batch_dir,0755);
+        FILE*fb=fopen(batch_path,"w");
+        if(fb){for(int i=total-1;i>=last_cnt;i--){const char*s=log[i].c_str();const char*p=strchr(s,'|');fprintf(fb,"%s\n",p?p+1:s);}fclose(fb);}
+    }
+    // 4. 上传(ossutil -r递归, 自动创建目录结构)
+    system("bash -c 'ossutil cp -r /tmp/oss_ready/ oss://smartcamera-logs/ -f' >/dev/null 2>&1 && bash -c 'rm -rf /tmp/oss_ready/*' >/dev/null 2>&1");
+    // 5. 上传失败的文件移到pending
+    system("bash -c 'for d in /tmp/oss_ready/*/; do [ -d \"$d\" ] && mkdir -p /tmp/oss_pending && mv \"$d\" /tmp/oss_pending/; done' >/dev/null 2>&1 &");
+    last_cnt=total;
+}
+static bool is_v(int cls){return cls==1||cls==2||cls==3||cls==5||cls==6||cls==7;}
+static void draw_boxes(cv::Mat&f,const std::vector<DetectBox>&bx){for(auto&b:bx){int l=std::max(0,(int)b.left),t=std::max(0,(int)b.top),r=std::min(f.cols-1,(int)b.right),bt=std::min(f.rows-1,(int)b.bottom);unsigned char B,G,R;if(b.class_id==0){B=150;G=0;R=255;}else if(is_v(b.class_id)){B=255;G=80;R=0;}else{B=0;G=255;R=0;}for(int y=t;y<=bt;y++){auto*row=f.ptr(y);bool te=(y-t<4),be=(bt-y<4);for(int x=l;x<=r;x++){bool le=(x-l<4),re=(r-x<4);if((te||be)||(le||re)){row[x*3]=B;row[x*3+1]=G;row[x*3+2]=R;}}}}}
+
+// ======================== F通道: MIPI CSI 摄像头 (V4L2原生) ========================
+// 硬件: IMX415 -> rkisp mainpath, 节点 /dev/video-camera0(=video22), 多平面NV12, MMAP零拷贝
+// rkaiq_3A_server 已在系统启动时运行, 直接抓流即可
+struct V4L2Cam{
+    static const int NB=4;
+    int fd=-1, w=0, h=0, nplanes=1;
+    size_t y_stride=0, uv_stride=0;
+    void*  y_ptr[NB]={}; void* uv_ptr[NB]={};
+    size_t y_len[NB]={};  size_t uv_len[NB]={};
+    bool   streaming=false;
+
+    bool open_cam(const char*dev,int W,int H){
+        fd=open(dev,O_RDWR|O_NONBLOCK,0);
+        if(fd<0){printf("[fcam] open %s failed: %s\n",dev,strerror(errno));return false;}
+        // 设置格式: 多平面 NV12 (rkisp mainpath 仅支持 MPLANE)
+        v4l2_format fmt={};
+        fmt.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        fmt.fmt.pix_mp.width=W; fmt.fmt.pix_mp.height=H;
+        fmt.fmt.pix_mp.pixelformat=V4L2_PIX_FMT_NV12;
+        fmt.fmt.pix_mp.field=V4L2_FIELD_NONE;
+        if(ioctl(fd,VIDIOC_S_FMT,&fmt)<0){printf("[fcam] S_FMT failed: %s\n",strerror(errno));close_cam();return false;}
+        w=fmt.fmt.pix_mp.width; h=fmt.fmt.pix_mp.height; nplanes=fmt.fmt.pix_mp.num_planes;
+        y_stride=fmt.fmt.pix_mp.plane_fmt[0].bytesperline; if(y_stride<(size_t)w)y_stride=w;
+        uv_stride=(nplanes>1)?fmt.fmt.pix_mp.plane_fmt[1].bytesperline:y_stride; if(uv_stride<(size_t)w)uv_stride=w;
+        // 申请 MMAP 缓冲
+        v4l2_requestbuffers req={};
+        req.count=NB; req.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; req.memory=V4L2_MEMORY_MMAP;
+        if(ioctl(fd,VIDIOC_REQBUFS,&req)<0||req.count<2){printf("[fcam] REQBUFS failed\n");close_cam();return false;}
+        // 映射每个缓冲的各平面并入队
+        for(int i=0;i<(int)req.count&&i<NB;i++){
+            v4l2_buffer buf={}; v4l2_plane planes[2]={};
+            buf.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; buf.memory=V4L2_MEMORY_MMAP;
+            buf.index=i; buf.m.planes=planes; buf.length=2;
+            if(ioctl(fd,VIDIOC_QUERYBUF,&buf)<0){printf("[fcam] QUERYBUF failed\n");close_cam();return false;}
+            y_len[i]=planes[0].length;
+            y_ptr[i]=mmap(NULL,planes[0].length,PROT_READ|PROT_WRITE,MAP_SHARED,fd,planes[0].m.mem_offset);
+            if(nplanes>1){
+                uv_len[i]=planes[1].length;
+                uv_ptr[i]=mmap(NULL,planes[1].length,PROT_READ|PROT_WRITE,MAP_SHARED,fd,planes[1].m.mem_offset);
+            }
+            if(ioctl(fd,VIDIOC_QBUF,&buf)<0){printf("[fcam] QBUF failed\n");close_cam();return false;}
+        }
+        int type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        if(ioctl(fd,VIDIOC_STREAMON,&type)<0){printf("[fcam] STREAMON failed\n");close_cam();return false;}
+        streaming=true;
+        printf("[fcam] V4L2 OK %dx%d planes=%d ystride=%zu\n",w,h,nplanes,y_stride);fflush(stdout);
+        return true;
+    }
+
+    // 读取一帧转BGR; 返回false=暂无帧(30ms内)
+    bool read(cv::Mat&bgr){
+        if(fd<0)return false;
+        struct pollfd pfd={fd,POLLIN,0};
+        if(poll(&pfd,1,30)<=0||!(pfd.revents&POLLIN))return false;
+        v4l2_buffer buf={}; v4l2_plane planes[2]={};
+        buf.type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE; buf.memory=V4L2_MEMORY_MMAP;
+        buf.m.planes=planes; buf.length=2;
+        if(ioctl(fd,VIDIOC_DQBUF,&buf)<0)return false;
+        int idx=buf.index;
+        // 组装连续NV12(Y在上, UV在下), 处理行对齐stride
+        cv::Mat yuv(h*3/2,w,CV_8UC1);
+        unsigned char*yb=(unsigned char*)y_ptr[idx];
+        for(int r=0;r<h;r++) memcpy(yuv.data+(size_t)r*w, yb+(size_t)r*y_stride, w);
+        unsigned char*ub=(nplanes>1)?(unsigned char*)uv_ptr[idx]:yb+(size_t)h*y_stride;
+        for(int r=0;r<h/2;r++) memcpy(yuv.data+(size_t)(h+r)*w, ub+(size_t)r*uv_stride, w);
+        cv::cvtColor(yuv,bgr,cv::COLOR_YUV2BGR_NV12);
+        ioctl(fd,VIDIOC_QBUF,&buf);
+        return true;
+    }
+
+    void close_cam(){
+        if(fd<0)return;
+        if(streaming){int type=V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;ioctl(fd,VIDIOC_STREAMOFF,&type);streaming=false;}
+        for(int i=0;i<NB;i++){
+            if(y_ptr[i]){munmap(y_ptr[i],y_len[i]);y_ptr[i]=nullptr;}
+            if(uv_ptr[i]){munmap(uv_ptr[i],uv_len[i]);uv_ptr[i]=nullptr;}
+        }
+        close(fd);fd=-1;
+    }
+};
+
+int main(){
+    // 杀 Weston 释放 DRM
+    system("pkill -9 weston 2>/dev/null");usleep(600000);
+
+    // 初始化 FreeType 系统字体
+    ft_init();
+
+    Drm drm;if(drm.init()<0){printf("DRM init failed\n");return 1;}
+    int kbd_fds[3]={-1,-1,-1};
+    // TCP输入监听(端口9999, nc连接打字)
+    int tcp_fd=socket(AF_INET,SOCK_STREAM,0);
+    {int one=1;setsockopt(tcp_fd,SOL_SOCKET,SO_REUSEADDR,&one,sizeof(one));
+     sockaddr_in sa={};sa.sin_family=AF_INET;sa.sin_port=htons(9999);sa.sin_addr.s_addr=INADDR_ANY;
+     bind(tcp_fd,(sockaddr*)&sa,sizeof(sa));listen(tcp_fd,3);}
+    int tcp_cli=-1; // 当前TCP客户端fd
+    Touch touch;
+    // 键盘设备探测(尝试event0-event9)
+    {int n=0;for(int i=0;i<10&&n<3;i++){char dev[32];snprintf(dev,32,"/dev/input/event%d",i);
+        int fd=open(dev,O_RDONLY|O_NONBLOCK);if(fd<0)continue;
+        unsigned long bits[8]={};ioctl(fd,EVIOCGBIT(0,sizeof(bits)),bits);
+        if(bits[0]&(1<<EV_KEY)){kbd_fds[n++]=fd;}else close(fd);}}
+    Detector det;
+    if(!det.init("/root/yolo11s.rknn",0)){printf("RKNN init failed\n");return 1;}
+    printf("[DET] model loaded\n");fflush(stdout);
+
+    cv::VideoCapture cap0,cap1,cap2,cap3;
+    cap0.open("/userdata/videos/a.mp4");printf("[c0] %d\n",cap0.isOpened());
+    cap1.open("/userdata/videos/b.mp4");printf("[c1] %d\n",cap1.isOpened());
+    cap2.open("/userdata/videos/c.mp4");printf("[c2] %d\n",cap2.isOpened());
+    cap3.open("/userdata/videos/d.mp4");printf("[c3] %d\n",cap3.isOpened());
+    cv::VideoCapture cap_cam;bool cam_mode=false;
+    V4L2Cam fcam; // F通道: MIPI CSI摄像头(V4L2原生)
+    // 帧定时: 按25fps(40ms/帧)调度, 保证与原视频播放速度一致
+    int frame_interval_us[4]={33333,41708,33367,33367}; // A=30 B=23.97 C/D=29.97fps
+    int fps_num[4]={30,2397,30000,30000},fps_den[4]={1,100,1001,1001};
+
+    enum{MAIN,VIDEO,FCAM}state=MAIN;int cam=-1;
+    // 按钮: A-F 左侧竖向排列
+    int bw=360,bh=100,gap=12,lx=50,ly0=110;
+    struct{int x,y;}btn[8];
+    for(int i=0;i<8;i++){btn[i].x=lx;btn[i].y=ly0+i*(bh+gap);}
+    C4 btn_color=mk(15,15,30), btn_gray=mk(60,60,60);
+    // VIDEO模式叠加显示开关(默认全开)
+    bool show_boxes=true, show_masks=true, show_parking=true;
+    // 检测蒙版: 每路摄像头可定义不规则多边形, 只检测区域内目标
+    std::vector<std::vector<std::pair<int,int>>> masks[4];
+    masks[0]={{{0,343},{726,275},{1278,330},{751,567},{0,434}}}; // A
+    masks[1]={{{0,414},{698,295},{1919,455},{1919,1079},{0,1079}}}; // B
+    masks[2]={{{481,128},{798,168},{1264,1079},{647,1079}},{{714,0},{1046,246},{1265,305},{1681,561},{1714,424},{920,0}},{{197,59},{340,56},{335,132},{174,136}}}; // C三蒙版
+    masks[3]={{{0,483},{1333,438},{1919,879},{1919,1079},{0,1079}}}; // D
+    // 停车位蒙版(绘制用, 紫色线条)
+    std::vector<std::vector<std::pair<int,int>>> parking_masks[4];
+    // 停车位逻辑(检测用, A通道帧空间÷1.5, B/C/D画布空间不变)
+    std::vector<std::vector<std::pair<int,int>>> parking_logic[4];
+    // A通道停车位(绘制, 画布空间1920×1080)
+    parking_masks[0]={
+        {{0,523},{1094,415},{1193,427},{0,556}},
+        {{0,585},{1173,448},{1384,465},{210,653}},
+        {{480,652},{578,703},{653,686},{765,744},{1639,509},{1468,472}},
+        {{871,808},{1148,834},{1905,506},{1793,495}}
+    };
+    // D通道停车位
+    parking_masks[3]={
+        {{116,481},{887,451},{1090,484},{239,522}},
+        {{91,557},{419,548},{227,979},{0,987},{0,662}},
+        {{640,541},{1057,519},{1290,908},{624,955}},
+        {{1294,539},{1448,532},{1883,853},{1633,879}}
+    };
+    // C通道停车位
+    parking_masks[2]={
+        {{197,59},{340,56},{335,132},{174,136}},
+        {{481,128},{798,168},{1264,1079},{647,1079}},
+        {{713,0},{873,0},{1229,224},{1045,244}},
+        {{1155,273},{1334,245},{1708,452},{1603,512},{1265,303}}
+    };
+    // B通道停车位
+    // A通道停车位(逻辑, 帧空间1280×720, 画布÷1.5四舍五入)
+    parking_logic[0]={
+        {{0,349},{729,277},{795,285},{0,371}},
+        {{0,390},{782,299},{923,310},{140,435}},
+        {{320,435},{385,469},{435,457},{510,496},{1093,339},{979,315}},
+        {{581,539},{765,556},{1270,337},{1195,330}}
+    };
+    // B/C/D停车位逻辑与绘制相同(画布1920×1080)
+    parking_logic[1]={
+        {{0,414},{698,295},{870,315},{0,494}},
+        {{0,568},{974,357},{1119,399},{0,728}},
+        {{596,658},{1312,429},{1586,444},{1178,686}},
+        {{1390,807},{1725,963},{1918,636},{1916,458}}
+    };
+    parking_logic[2]={
+        {{197,59},{340,56},{335,132},{174,136}},
+        {{481,128},{798,168},{1264,1079},{647,1079}},
+        {{713,0},{873,0},{1229,224},{1045,244}},
+        {{1155,273},{1334,245},{1708,452},{1603,512},{1265,303}}
+    };
+    parking_logic[3]={
+        {{116,481},{887,451},{1090,484},{239,522}},
+        {{91,557},{419,548},{227,979},{0,987},{0,662}},
+        {{640,541},{1057,519},{1290,908},{624,955}},
+        {{1294,539},{1448,532},{1883,853},{1633,879}}
+    };
+    parking_masks[1]={
+        {{0,414},{698,295},{870,315},{0,494}},
+        {{0,568},{974,357},{1119,399},{0,728}},
+        {{596,658},{1312,429},{1586,444},{1178,686}},
+        {{1390,807},{1725,963},{1918,636},{1916,458}}
+    };
+    cv::Mat frame,fb0,fb1,fb2,fb3,fb_cam;
+    {cv::Mat t;cap0.read(t);if(!t.empty())t.copyTo(fb0);
+     cap1.read(t);if(!t.empty())t.copyTo(fb1);
+     cap2.read(t);if(!t.empty())t.copyTo(fb2);
+     cap3.read(t);if(!t.empty())t.copyTo(fb3);}
+    // F通道摄像头(MIPI CSI): 开机即打开, 全程后台抓帧+检测(与A-D对等)
+    if(fcam.open_cam("/dev/video-camera0",1280,720)){cv::Mat t;if(fcam.read(t)&&!t.empty())t.copyTo(fb_cam);}
+    else printf("[fcam] startup open failed, F通道将显示无信号\n");
+    // 绝对时钟: 四路视频启动时间
+    std::chrono::steady_clock::time_point video_start[4];
+    int64_t frame_cnt[4]={};
+    {auto now0=std::chrono::steady_clock::now();
+     for(int i=0;i<4;i++){video_start[i]=now0;frame_cnt[i]=1;}}
+    printf("[GUI] started, %dx%d\n",drm.w,drm.h);fflush(stdout);
+
+    int empty_cnt=0, det_skip=0, fps_cnt=0, time_skip=0;
+    char tb_time[32]={}, tb_date[32]={};
+    {time_t now=time(0);struct tm*lt=localtime(&now);
+     strftime(tb_time,32,"%H:%M:%S",lt);strftime(tb_date,32,"%Y.%m.%d",lt);}
+    std::vector<DetectBox> last_boxes;
+    char fps_str[16]={"FPS: --"}, det_str[16]={"NPU: --ms"}, car_str[16]={"CAR:0"}, per_str[16]={"PER:0"};
+    int det_ms=0, cnt_car_acc=0, cnt_per_acc=0, avg_cnt=0;
+    int chan_car[4]={0}, chan_per[4]={0}, chan_cap[4]={200,120,24,40}; // 每通道车/人/容量
+    char chan_info[4][32]={}, chan_status[4][16]={};
+    int bg_det_skip[4]={};
+    bool chan_enabled[8]={true,true,true,true,true,true,true,true};
+    std::vector<std::string> event_log;
+    int cb_x0=450,cb_y0=105,cb_btn=54,cb_gap=6;
+    int log_x=450,log_y=175,log_w=700,log_h=820,log_line_h=30;
+    int llm_x=1160,llm_y=175,llm_w=700,llm_h=820;
+    std::vector<std::string> llm_log;   // 大模型对话历史
+    std::string input_buf;              // 输入缓冲
+    static int bg_sel=0; static bool bg_done=false;
+    CarTracker car_trackers[4];
+    // F通道(MIPI CSI): 复用C区(索引2)蒙版/停车位几何, 但用独立tracker/检测框, 不污染后台C通道
+    CarTracker fcam_tracker;
+    std::vector<DetectBox> fcam_boxes;
+    int fcam_det_skip=0, fcam_det_ms=0, fcam_bg_tick=0;
+    int fcam_fps_cnt=0; char fcam_fps_str[16]={"FPS: --"};
+    auto fcam_fps_t0=std::chrono::steady_clock::now();
+    auto fps_t0=std::chrono::steady_clock::now();
+
+    // 启动时后台同步RAG知识库
+    system("mkdir -p /tmp/rag_data && ossutil cp -r oss://smartcamera-logs/ /tmp/rag_data/ -f --update >/dev/null 2>&1 &");
+    // 启动欢迎语
+    llm_add_wrapped(llm_log,"欢迎使用智能停车场管理系统，有什么问题可以问我哦~");
+    while(1){
+        touch.poll();int tx,ty;touch.landscape(tx,ty);
+        llm_check(llm_log);
+        // 键盘输入
+        for(int k=0;k<3;k++)if(kbd_fds[k]>=0){input_event ev;while(read(kbd_fds[k],&ev,sizeof(ev))>0){
+            if(ev.type==EV_KEY&&ev.value==1){
+                if(ev.code==KEY_ENTER){llm_add_wrapped(llm_log,input_buf.c_str(),"> ");llm_ask(input_buf.c_str());input_buf.clear();}
+                else if(ev.code==KEY_BACKSPACE&&!input_buf.empty())input_buf.pop_back();
+                else if(ev.code>=KEY_1&&ev.code<=KEY_0){input_buf+="1234567890"[ev.code-KEY_1];}
+                else if(ev.code>=KEY_A&&ev.code<=KEY_Z){input_buf+='a'+(ev.code-KEY_A);}
+                else if(ev.code==KEY_SPACE)input_buf+=' ';
+                else if(ev.code==KEY_DOT)input_buf+='.';
+                else if(ev.code==KEY_COMMA)input_buf+=',';
+                else if(ev.code==KEY_MINUS)input_buf+='-';
+                else if(ev.code==KEY_SLASH)input_buf+='/';
+            }
+        }}
+        // TCP输入(select非阻塞accept+read)
+        {fd_set rfds;FD_ZERO(&rfds);FD_SET(tcp_fd,&rfds);timeval tv={0,0};
+         if(tcp_cli>=0)FD_SET(tcp_cli,&rfds);
+         if(select((tcp_cli>=0?tcp_cli:tcp_fd)+1,&rfds,NULL,NULL,&tv)>0){
+             if(FD_ISSET(tcp_fd,&rfds)){tcp_cli=accept(tcp_fd,NULL,NULL);
+                 if(tcp_cli>=0){printf("[tcp] connected\\n");fflush(stdout);fcntl(tcp_cli,F_SETFL,O_NONBLOCK);}}
+             if(tcp_cli>=0&&FD_ISSET(tcp_cli,&rfds)){char tcp_buf[256];int n=read(tcp_cli,tcp_buf,255);
+                 if(n>0){tcp_buf[n]=0;for(char*p=tcp_buf;*p;p++){if(*p=='\n'){llm_add_wrapped(llm_log,input_buf.c_str(),"> ");llm_ask(input_buf.c_str());input_buf.clear();}else if(*p==127||*p==8){if(!input_buf.empty())input_buf.pop_back();}else if(*p>=32)input_buf+=*p;}}
+                 else{close(tcp_cli);tcp_cli=-1;}
+             }
+         }}
+
+        // 后台四路同时原速播放: 绝对时钟驱动, 落后时跳帧追赶
+        // (state!=MAIN: 前台在看某通道/F摄像头时, 后台A-D轮询调度, 每轮只处理1路以省CPU)
+        {for(int c=0;c<4;c++){
+            if(state!=MAIN){
+                if(c==cam)continue;
+                if(bg_done)continue;
+                int picked=-1, nc=0;
+                for(int x=0;x<4;x++)if(x!=cam){if(nc==bg_sel)picked=x;nc++;}
+                if(c!=picked)continue;
+                bg_done=true; bg_sel=(bg_sel+1)%nc;
+            }
+            auto now_clk=std::chrono::steady_clock::now();
+            int64_t elaps=std::chrono::duration_cast<std::chrono::microseconds>(now_clk-video_start[c]).count();
+            int target=(int)(elaps*fps_num[c]/fps_den[c]/1000000);
+            // 跳帧追赶(最多60帧)
+            cv::Mat t; bool rok=false;
+            if(frame_cnt[c]<target){
+                cv::Mat skip; int smax=target;
+                if(smax-frame_cnt[c]>60)smax=frame_cnt[c]+60;
+                while(frame_cnt[c]<smax){
+                    if(c==0)rok=cap0.read(skip);else if(c==1)rok=cap1.read(skip);
+                    else if(c==2)rok=cap2.read(skip);else rok=cap3.read(skip);
+                    if(!rok)break; frame_cnt[c]++;
+                }
+            }
+            // 读当前帧
+            if(c==0)rok=cap0.read(t);else if(c==1)rok=cap1.read(t);
+            else if(c==2)rok=cap2.read(t);else rok=cap3.read(t);
+            if(!rok||t.empty())continue;
+            frame_cnt[c]++;
+            // 存入缓冲帧
+            if(c==0)t.copyTo(fb0);else if(c==1)t.copyTo(fb1);else if(c==2)t.copyTo(fb2);else t.copyTo(fb3);
+            // 检测: 每2轮检一次(降低CPU占用); 看F摄像头时后台通道每轮都检, 补偿轮询稀疏保证跟踪连续
+            if(!masks[c].empty()){
+                bg_det_skip[c]=(bg_det_skip[c]+1)%2;
+                if(bg_det_skip[c]==0 || state==FCAM){
+                    std::vector<DetectBox> bbx;det.detect(t,bbx);
+                    int dwb=1920,dhb=t.rows*1920/t.cols;
+                    if(dhb>1080){dhb=1080;dwb=t.cols*1080/t.rows;}
+                    int xob=(1920-dwb)/2,yob=(1080-dhb)/2;
+                    int cc=0,pc=0;for(auto&b:bbx){int cxx=(b.left+b.right)/2,cyy=(b.top+b.bottom)/2;
+                        if(c!=0){cxx=xob+cxx*dwb/t.cols;cyy=yob+cyy*dhb/t.rows;}
+                        if(pt_in_any_poly(cxx,cyy,masks[c])){if(is_v(b.class_id))cc++;else if(b.class_id==0)pc++;}
+                    }
+                    chan_per[c]=pc;
+                    std::vector<DetectBox> veh;for(auto&b:bbx)if(is_v(b.class_id))veh.push_back(b);
+                    std::vector<CarTracker::Event> evs;
+                    car_trackers[c].update(veh,masks[c],parking_logic[c],t,c,evs);
+                    for(auto&ev:evs)if(chan_enabled[c]){
+                        int64_t ems=ms_now();
+                        DetectBox dummy={};DetectBox*bx=&dummy;
+                        for(auto&tk:car_trackers[c].tracks)if(tk.id==ev.id){bx=&tk.box;break;}
+                        add_event(event_log,c,ev.type,ev.id,ems,t,*bx);
+                    }
+                    chan_car[c]=cc;
+                    snprintf(chan_info[c],32,"数量:%d/%d",cc,chan_cap[c]);
+                    {float r=(float)cc/chan_cap[c];snprintf(chan_status[c],16,"状态:%s",r<0.3f?"畅通":r<0.7f?"中等":"拥挤");}
+                }
+            }
+        }}
+        bg_done=false;
+
+        // ===== F通道(MIPI CSI摄像头)后台抓帧+检测: 全程运行, 与A-D对等 =====
+        // 前台(FCAM)每轮抓帧保证流畅+每3帧检测一次; 后台每6轮抓一次(几乎不影响A-E帧率)、每2次抓帧检测一次
+        if(fcam.fd>=0 && (state==FCAM || (++fcam_bg_tick)%6==0)){
+            cv::Mat cf;
+            if(fcam.read(cf)&&!cf.empty()){
+                cf.copyTo(fb_cam);
+                fcam_det_skip=(fcam_det_skip+1)%(state==FCAM?4:2);
+                if(fcam_det_skip==0){
+                    const int FC=2; // 复用C区蒙版/停车位几何
+                    std::vector<DetectBox> bxs;
+                    auto t1=std::chrono::steady_clock::now();
+                    det.detect(cf,bxs);
+                    auto t2=std::chrono::steady_clock::now();
+                    fcam_det_ms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();
+                    if(!masks[FC].empty()){
+                        // 车辆进出/违停跟踪(独立tracker; 事件记为F区)
+                        std::vector<DetectBox> veh;for(auto&b:bxs)if(is_v(b.class_id))veh.push_back(b);
+                        std::vector<CarTracker::Event> evs;
+                        fcam_tracker.update(veh,masks[FC],parking_logic[FC],cf,FC,evs);
+                        for(auto&ev:evs)if(chan_enabled[5]){
+                            int64_t ems=ms_now();
+                            DetectBox dummy={};DetectBox*bx=&dummy;
+                            for(auto&tk:fcam_tracker.tracks)if(tk.id==ev.id){bx=&tk.box;break;}
+                            add_event(event_log,5,ev.type,ev.id,ems,cf,*bx); // chan=5 → "F区"
+                        }
+                        // 蒙版过滤(帧→画布坐标转换, 仅保留蒙版内目标)
+                        std::vector<DetectBox> filtered;
+                        int dww=1920,dhh=cf.rows*1920/cf.cols;
+                        if(dhh>1080){dhh=1080;dww=cf.cols*1080/cf.rows;}
+                        int xoo=(1920-dww)/2,yoo=(1080-dhh)/2;
+                        for(auto&b:bxs){
+                            int cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
+                            cx=xoo+cx*dww/cf.cols;cy=yoo+cy*dhh/cf.rows;
+                            if(pt_in_any_poly(cx,cy,masks[FC]))filtered.push_back(b);
+                        }
+                        fcam_boxes=filtered;
+                    }else fcam_boxes=bxs;
+                }
+            }
+        }
+
+        oss_upload(event_log); // 每60s上传到OSS(增量+断点续传)
+        if(state==MAIN){
+            int bk=drm.fr^1;drm.clear(bk);
+            // 顶部标题栏背景
+            drm.fL(bk,0,0,1920,100,mk(15,15,30));
+            // 标题 — 水平居中
+            ft_text_center(drm,bk,0,8,1920,60,"ATK 安防监控系统",36,mk(255,255,255));
+            // 时间 — 右上角右对齐
+            {time_t now=time(0);struct tm*lt=localtime(&now);char tb[32];
+             strftime(tb,32,"%H:%M:%S",lt);ft_text_right(drm,bk,1890,15,tb,26,mk(220,220,220));
+             strftime(tb,32,"%Y.%m.%d",lt);ft_text_right(drm,bk,1890,50,tb,20,mk(150,150,150));}
+            // 左侧按钮 A-F: A-F可点击, G-H灰色装饰
+            for(int i=0;i<8;i++){
+                C4 clr=(i<6)?btn_color:btn_gray;
+                drm.fL(bk,btn[i].x,btn[i].y,bw,bh,clr);
+                drm.bL(bk,btn[i].x,btn[i].y,bw,bh,mk(255,255,255),3);
+                char big[2]={(char)('A'+i),0};
+                C4 tc=(i<6)?mk(255,255,255):mk(120,120,120);
+                int cx=btn[i].x+120, cy=btn[i].y+10;
+                ft_text(drm,bk,cx-ft_width(big,80)/2,cy+20,big,80,tc);
+                if(i<4 && chan_info[i][0]){
+                    float r=(float)chan_car[i]/chan_cap[i];
+                    C4 sc=r<0.3f?mk(0,255,0):r<0.7f?mk(255,165,0):mk(255,0,0);
+                    ft_text(drm,bk,btn[i].x+240,btn[i].y+bh-50,chan_status[i],20,sc);
+                    ft_text(drm,bk,btn[i].x+240,btn[i].y+bh-20,chan_info[i],20,tc);
+                }
+            }
+            // === 通道按钮 A-H (一行) ===
+            for(int i=0;i<8;i++){
+                int cx=cb_x0+i*120, cy=cb_y0;
+                drm.fL(bk,cx,cy,cb_btn,cb_btn,chan_enabled[i]?mk(30,80,30):mk(50,50,50));
+                drm.bL(bk,cx,cy,cb_btn,cb_btn,chan_enabled[i]?mk(0,200,0):mk(100,100,100),2);
+                char lb[2]={char('A'+i),0};
+                C4 tc=chan_enabled[i]?mk(0,255,0):mk(130,130,130);
+                ft_text(drm,bk,cx+cb_btn/2+15,cy+cb_btn/2-14,lb,44,tc);
+            }
+            // === 日志框(无滚动, 最新在上) ===
+            drm.fL(bk,log_x,log_y,log_w,log_h,mk(5,5,15));
+            drm.bL(bk,log_x,log_y,log_w,log_h,mk(60,60,60));
+            {int vis=log_h/log_line_h;int shown=0;
+             for(int i=0;shown<vis&&i<(int)event_log.size();i++){
+                int ei=(int)event_log.size()-1-i;
+                const char*s=event_log[ei].c_str();
+                // 跳过时间戳前缀 "epoch_ms|"
+                const char*pipe=strchr(s,'|');
+                const char*text=pipe?pipe+1:s;
+                if(!chan_enabled[text[0]-'A']){continue;} // 跳过已取消通道
+                ft_text(drm,bk,480,log_y+15+shown*log_line_h,text,24,mk(200,200,200));
+                shown++;
+             }}
+            // === 大模型交互框 ===
+            drm.fL(bk,llm_x,llm_y,llm_w,llm_h,mk(5,5,15));
+            drm.bL(bk,llm_x,llm_y,llm_w,llm_h,mk(60,60,60));
+            {int vis=llm_h/log_line_h;int start=std::max(0,(int)llm_log.size()-vis);
+             for(int i=start;i<(int)llm_log.size();i++){
+                C4 llm_clr=mk(200,200,200);if(llm_log[i].rfind("[AI]",0)==0)llm_clr=mk(0,255,0);
+                ft_text(drm,bk,llm_x+20,llm_y+15+(i-start)*log_line_h,llm_log[i].c_str(),24,llm_clr);
+            }}
+            // 输入框(在大模型框内部底部, 居中, 宽度比外框小)
+            int inp_w=620,inp_h=36;
+            int inp_x=llm_x+(llm_w-inp_w)/2,inp_y=llm_y+llm_h-inp_h-8;
+            drm.fL(bk,inp_x,inp_y,inp_w,inp_h,mk(20,20,40));
+            drm.bL(bk,inp_x,inp_y,inp_w,inp_h,mk(80,80,80),2);
+            if(!input_buf.empty())ft_text(drm,bk,inp_x+8,inp_y+6,input_buf.c_str(),22,mk(200,200,200));
+            {static int blink=0;if(++blink%40<20)ft_text(drm,bk,inp_x+8+ft_width(input_buf.c_str(),22),inp_y+6,"|",22,mk(255,255,255));}
+            drm.flip();
+            // === 触摸: 通道按钮切换 ===
+            static bool was_down=false;
+            if(touch.down){
+                if(!was_down){for(int i=0;i<8;i++){
+                    int cx=cb_x0+i*120, cy=cb_y0;
+                    if(tx>=cx&&tx<cx+cb_btn&&ty>=cy&&ty<cy+cb_btn){chan_enabled[i]=!chan_enabled[i];break;}
+                }was_down=true;}
+            }else{was_down=false;}
+            if(touch.clicked){for(int i=0;i<5;i++)if(tx>=btn[i].x&&tx<btn[i].x+bw&&ty>=btn[i].y&&ty<btn[i].y+bh){
+                cam_mode=(i==4); cam=(i==4?2:i); state=VIDEO;empty_cnt=0;
+                cnt_car_acc=cnt_per_acc=avg_cnt=0;
+                if(cam_mode){cap_cam.release();cap_cam.open("rtsp://192.168.131.62:1935",cv::CAP_FFMPEG);
+                    setenv("OPENCV_FFMPEG_CAPTURE_OPTIONS","rtsp_transport;tcp|buffer_size;1024|max_delay;100000",1);cap_cam.set(cv::CAP_PROP_BUFFERSIZE,1);printf("[cam] %d\n",cap_cam.isOpened());}
+                snprintf(car_str,16,cam_mode?"CAR:--":"CAR:%d",cam_mode?0:chan_car[cam]);
+                snprintf(per_str,16,cam_mode?"PER:--":"PER:%d",cam_mode?0:chan_per[cam]);
+                // 视频时钟已在后台运行, 直接显示缓冲帧
+                if(cam_mode){cap_cam.read(frame);}
+                else if(cam==0)fb0.copyTo(frame);else if(cam==1)fb1.copyTo(frame);
+                else if(cam==2)fb2.copyTo(frame);else fb3.copyTo(frame);
+                {int bk2=drm.fr^1;drm.clear(bk2);
+                 drm.rot_write(bk2,frame,1920,1080);
+                 drm.fL(bk2,20,20,90,50,mk(50,0,0));drm.bL(bk2,20,20,90,50,mk(200,100,100));
+                 ft_text(drm,bk2,85-ft_width("返回",22)/2,38,"返回",22,mk(255,200,200));
+                 // 叠加按钮
+                 struct{C4 c;const char*t;}tbtn[]={{mk(0,0,255),"检测框"},{mk(255,255,0),"停车场"},{mk(255,0,255),"停车位"}};
+                 for(int j=0;j<3;j++){int kx=130+j*108;drm.fL(bk2,kx,20,100,40,tbtn[j].c);drm.bL(bk2,kx,20,100,40,mk(120,120,120));ft_text(drm,bk2,kx+50-ft_width(tbtn[j].t,22)/2+10,32,tbtn[j].t,22,mk(255,255,255));}
+                 drm.flip();}
+                break;}}
+            // === F通道(i==5): 进入MIPI CSI摄像头画面(摄像头已在后台运行) ===
+            if(touch.clicked&&tx>=btn[5].x&&tx<btn[5].x+bw&&ty>=btn[5].y&&ty<btn[5].y+bh){
+                state=FCAM;
+            }
+            usleep(2000);
+        }else if(state==FCAM){
+            // ===== F通道前台显示: 直接用后台已抓帧+检测结果, 叠加C区蒙版/停车位/检测框/日志按钮 =====
+            const int FC=2;
+            frame.release();
+            if(!fb_cam.empty())fb_cam.copyTo(frame);
+            if(show_boxes&&!frame.empty())draw_boxes(frame,fcam_boxes);
+            int bk=drm.fr^1;drm.clear(bk);
+            // 左下角: CAR/PER/NPU/FPS (与其它通道一致)
+            {int cc=0,pc=0;for(auto&b:fcam_boxes){if(b.class_id==0)pc++;else if(is_v(b.class_id))cc++;}
+             char s[16];const int IX=20,IFS=22,IDY=22,IY0=1000;
+             snprintf(s,16,"CAR:%d",cc);ft_text(drm,bk,IX,IY0,s,IFS,mk(0,0,255));
+             snprintf(s,16,"PER:%d",pc);ft_text(drm,bk,IX,IY0+IDY,s,IFS,mk(255,0,150));
+             snprintf(s,16,"NPU: %dms",fcam_det_ms);ft_text(drm,bk,IX,IY0+IDY*2,s,IFS,mk(255,200,0));
+             ft_text(drm,bk,IX,IY0+IDY*3,fcam_fps_str,IFS,mk(0,255,0));}
+            // 右上角时间
+            time_skip=(time_skip+1)%30;
+            if(time_skip==0){time_t now=time(0);struct tm*lt=localtime(&now);
+                strftime(tb_time,32,"%H:%M:%S",lt);strftime(tb_date,32,"%Y.%m.%d",lt);}
+            ft_text_right(drm,bk,1890,15,tb_time,26,mk(220,220,220));
+            ft_text_right(drm,bk,1890,50,tb_date,20,mk(150,150,150));
+            if(!frame.empty())drm.rot_write(bk,frame,1920,1080);
+            else ft_text_center(drm,bk,0,0,1920,1080,"F通道: 无摄像头信号",40,mk(255,80,80));
+            // C区蒙版(黄) + 停车位(紫)
+            if(show_masks&&!masks[FC].empty())draw_all_polys(drm,bk,masks[FC],mk(255,255,0));
+            if(show_parking&&!parking_logic[FC].empty())draw_all_polys(drm,bk,parking_logic[FC],mk(255,0,255));
+            // 返回按钮
+            drm.fL(bk,20,20,90,50,mk(50,0,0));drm.bL(bk,20,20,90,50,mk(200,100,100));
+            ft_text(drm,bk,85-ft_width("返回",22)/2,38,"返回",22,mk(255,200,200));
+            // 叠加显示按钮(检测框/停车场/停车位)
+            {int bx=130,bw2=100,bh2=40;
+             struct{C4 c;const char*t;}btns[]={{mk(0,0,255),"检测框"},{mk(255,255,0),"停车场"},{mk(255,0,255),"停车位"}};
+             for(int j=0;j<3;j++){
+                int kx=bx+j*(bw2+8);
+                bool*on=(j==0?&show_boxes:j==1?&show_masks:&show_parking);
+                drm.fL(bk,kx,20,bw2,bh2,*on?btns[j].c:mk(50,50,50));
+                drm.bL(bk,kx,20,bw2,bh2,mk(120,120,120));
+                ft_text(drm,bk,kx+50-ft_width(btns[j].t,22)/2+10,32,btns[j].t,22,*on?mk(255,255,255):mk(150,150,150));
+             }}
+            drm.flip();
+            // FPS统计(每2秒)
+            fcam_fps_cnt++;
+            auto fnow=std::chrono::steady_clock::now();
+            int fms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(fnow-fcam_fps_t0).count();
+            if(fms>=2000){double fp=fcam_fps_cnt*1000.0/fms;snprintf(fcam_fps_str,16,"FPS: %.0f",fp);fcam_fps_cnt=0;fcam_fps_t0=fnow;}
+            // 触摸: 叠加按钮切换 + 返回(摄像头保持后台运行, 不关闭)
+            if(touch.clicked){
+                for(int j=0;j<3;j++){int kx=130+j*108;if(tx>=kx&&tx<kx+100&&ty>=20&&ty<60){
+                    bool*on=(j==0?&show_boxes:j==1?&show_masks:&show_parking);*on=!*on;break;}}
+                if(tx>=20&&tx<=110&&ty>=20&&ty<=70){state=MAIN;cam=-1;}
+            }
+            usleep(500);
+        }else{
+            // 绝对时钟: 计算该播第几帧, 落后则跳帧追赶
+            auto now_clk=std::chrono::steady_clock::now();
+            int64_t elaps=std::chrono::duration_cast<std::chrono::microseconds>(now_clk-video_start[cam]).count();
+            int target=(int)(elaps*fps_num[cam]/fps_den[cam]/1000000);
+            // 落后超过1帧: 快速读帧丢弃(不渲染), 限制最多60帧
+            cv::Mat f; bool ok=false;
+            if(frame_cnt[cam]<target){
+                cv::Mat skip; int smax=target;
+                if(smax-frame_cnt[cam]>60)smax=frame_cnt[cam]+60;
+                while(frame_cnt[cam]<smax){
+                    if(cam==0)ok=cap0.read(skip);else if(cam==1)ok=cap1.read(skip);
+                    else if(cam==2)ok=cap2.read(skip);else ok=cap3.read(skip);
+                    if(!ok)break; frame_cnt[cam]++;
+                }
+            }
+            // 读当前帧
+            if(cam_mode){int n=0;while(cap_cam.grab()&&++n<10){} ok=cap_cam.retrieve(f);}
+            else if(cam==0)ok=cap0.read(f);else if(cam==1)ok=cap1.read(f);
+            else if(cam==2)ok=cap2.read(f);else ok=cap3.read(f);
+            if(!ok||f.empty()){
+                empty_cnt++;
+                if(empty_cnt>60){
+                    printf("[GUI] no video signal, back to MAIN\n");fflush(stdout);
+                    state=MAIN; cam=-1; empty_cnt=0;
+                }
+                usleep(3000);continue;
+            }
+            empty_cnt=0;
+            frame_cnt[cam]++;
+            f.copyTo(frame);
+            // NPU检测跳帧: 每3帧更新一次框位置, 但每帧都画(消除闪烁)
+            det_skip=(det_skip+1)%6;
+            if(det_skip==0){last_boxes.clear();auto t1=std::chrono::steady_clock::now();det.detect(frame,last_boxes);auto t2=std::chrono::steady_clock::now();det_ms=(int)std::chrono::duration_cast<std::chrono::milliseconds>(t2-t1).count();snprintf(det_str,16,"NPU: %dms",det_ms);
+                if(!masks[cam].empty()){
+                    // 车辆进出跟踪(全部车辆检测, 非仅蒙版内)
+                    {std::vector<DetectBox> veh;for(auto&b:last_boxes)if(is_v(b.class_id))veh.push_back(b);
+                     std::vector<CarTracker::Event> evs;
+                     car_trackers[cam].update(veh,masks[cam],parking_logic[cam],frame,cam,evs);
+                     for(auto&ev:evs)if(chan_enabled[cam]){
+                        int64_t ems=ms_now();
+                        DetectBox dummy={};DetectBox*bx=&dummy;
+                        for(auto&tk:car_trackers[cam].tracks)if(tk.id==ev.id){bx=&tk.box;break;}
+                        add_event(event_log,cam,ev.type,ev.id,ems,frame,*bx);
+                    }
+                     }
+                    // 蒙版过滤(仅显示蒙版内目标)
+                    std::vector<DetectBox> filtered;
+                    for(auto&b:last_boxes){
+                        int cx=(b.left+b.right)/2,cy=(b.top+b.bottom)/2;
+                        if(cam!=0){ // B/C/D: 帧→画布坐标转换
+                            int dww=1920,dhh=frame.rows*1920/frame.cols;
+                            if(dhh>1080){dhh=1080;dww=frame.cols*1080/frame.rows;}
+                            int xoo=(1920-dww)/2,yoo=(1080-dhh)/2;
+                            cx=xoo+cx*dww/frame.cols;cy=yoo+cy*dhh/frame.rows;
+                        } // A(cam==0): 保持简单对比
+                        if(pt_in_any_poly(cx,cy,masks[cam]))filtered.push_back(b);
+                    }
+                    last_boxes=filtered;
+                }
+            }
+            // 统计蒙版内车/人数量, 累加10帧取平均
+            {int cnt_car=0,cnt_per=0;
+            for(auto&b:last_boxes){if(b.class_id==0)cnt_per++;else if(is_v(b.class_id))cnt_car++;}
+            cnt_car_acc+=cnt_car;cnt_per_acc+=cnt_per;avg_cnt++;
+            if(avg_cnt>=30){
+                int cc=(int)(cnt_car_acc/30.0+0.5);
+                snprintf(car_str,16,"CAR:%d",cc);
+                snprintf(per_str,16,"PER:%d",(cnt_per_acc+29)/30);
+                chan_car[cam]=cc;
+                snprintf(chan_info[cam],32,"数量:%d/%d",cc,chan_cap[cam]);
+                {float r=(float)cc/chan_cap[cam];snprintf(chan_status[cam],16,"%s",r<0.3f?"畅通":r<0.7f?"中等":"拥挤");}
+                cnt_car_acc=cnt_per_acc=avg_cnt=0;
+            }}
+            if(show_boxes)draw_boxes(frame,last_boxes);
+            int bk=drm.fr^1;drm.clear(bk);
+            // 左下角: CAR/PER/NPU/FPS 左对齐等间距
+            const int IX=20,IFS=22,IDY=22,IY0=1000;
+            ft_text(drm,bk,IX,IY0,car_str,IFS,mk(0,0,255));
+            ft_text(drm,bk,IX,IY0+IDY,per_str,IFS,mk(255,0,150));
+            ft_text(drm,bk,IX,IY0+IDY*2,det_str,IFS,mk(255,200,0));
+            ft_text(drm,bk,IX,IY0+IDY*3,fps_str,IFS,mk(0,255,0));
+            // 时间: 每30帧更新字符串, 但每帧都渲染(不闪)
+            time_skip=(time_skip+1)%30;
+            if(time_skip==0){
+                time_t now=time(0);struct tm*lt=localtime(&now);
+                strftime(tb_time,32,"%H:%M:%S",lt);
+                strftime(tb_date,32,"%Y.%m.%d",lt);
+            }
+            ft_text_right(drm,bk,1890,15,tb_time,26,mk(220,220,220));
+            ft_text_right(drm,bk,1890,50,tb_date,20,mk(150,150,150));
+            drm.rot_write(bk,frame,1920,1080);
+            if(show_masks){
+                if(cam==0&&!masks[0].empty())draw_mask_A(drm,bk,masks[0][0]);
+                else if(!masks[cam].empty())draw_all_polys(drm,bk,masks[cam],mk(255,255,0));
+            }
+            if(show_parking&&!parking_logic[cam].empty()){
+                if(cam==0){for(auto&p:parking_masks[0])draw_poly(drm,bk,p,mk(255,0,255));}
+                else draw_all_polys(drm,bk,parking_logic[cam],mk(255,0,255));
+            }
+            // 返回按钮
+            drm.fL(bk,20,20,90,50,mk(50,0,0));drm.bL(bk,20,20,90,50,mk(200,100,100));
+            ft_text(drm,bk,85-ft_width("返回",22)/2,38,"返回",22,mk(255,200,200));
+            // 叠加显示按钮(蓝/黄/紫)
+            {int bx=130,bw2=100,bh2=40;
+             struct{C4 c;const char*t;}btns[]={{mk(0,0,255),"检测框"},{mk(255,255,0),"停车场"},{mk(255,0,255),"停车位"}};
+             for(int j=0;j<3;j++){
+                int kx=bx+j*(bw2+8);
+                bool*on=(j==0?&show_boxes:j==1?&show_masks:&show_parking);
+                drm.fL(bk,kx,20,bw2,bh2,*on?btns[j].c:mk(50,50,50));
+                drm.bL(bk,kx,20,bw2,bh2,mk(120,120,120));
+                ft_text(drm,bk,kx+50-ft_width(btns[j].t,22)/2+10,32,btns[j].t,22,*on?mk(255,255,255):mk(150,150,150));
+             }}
+            drm.flip();
+            // FPS统计 (每2秒输出)
+            fps_cnt++;
+            auto fps_now=std::chrono::steady_clock::now();
+            int fps_ms=std::chrono::duration_cast<std::chrono::milliseconds>(fps_now-fps_t0).count();
+            if(fps_ms>=2000){double fps=fps_cnt*1000.0/fps_ms;snprintf(fps_str,16,"FPS: %.0f",fps);fps_cnt=0;fps_t0=fps_now;}
+            if(touch.clicked){
+                // 叠加按钮(蓝/黄/紫)
+                for(int j=0;j<3;j++){int kx=130+j*108;if(tx>=kx&&tx<kx+100&&ty>=20&&ty<60){
+                    bool*on=(j==0?&show_boxes:j==1?&show_masks:&show_parking);*on=!*on;break;}}
+                if(tx>=20&&tx<=110&&ty>=20&&ty<=70){state=MAIN;cam=-1;empty_cnt=0;if(cam_mode){cam_mode=false;cap_cam.release();}}
+            }
+            // 帧定时: 绝对时钟已保证时速, 小sleep防busy-loop
+            if(state==VIDEO)usleep(500);
+        }}
+    det.release();return 0;
+}
